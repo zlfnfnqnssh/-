@@ -9,6 +9,31 @@
 | **Docker** | Milvus, DB 등 인프라 실행 | 기본 사용법만 |
 | **가상환경 (venv/conda)** | Python 패키지 관리 | 기본 |
 
+> **UI 방식: CLI (Command Line Interface)**
+> 웹 프레임워크 없이 터미널에서 명령어로 실행하는 방식입니다.
+
+**CLI 관련 패키지:**
+```
+argparse            # 명령어 인자 처리 (기본 내장)
+rich                # 터미널 출력 꾸미기 (테이블, 프로그레스바, 색상)
+click               # CLI 명령어 프레임워크 (argparse 대안, 선택)
+```
+
+**사용 예시:**
+```bash
+# 시스템 정보 수집
+python main.py collect --os linux --target localhost
+
+# 취약점 판정 실행
+python main.py scan --scan-id scan_20260401_001
+
+# 리포트 생성
+python main.py report --scan-id scan_20260401_001 --format pdf
+
+# 이전 진단과 비교
+python main.py compare --current scan_20260401_001 --previous scan_20260301_001
+```
+
 ---
 
 ## 역할별 필요 기술
@@ -134,6 +159,7 @@ pydantic              # LLM 출력 스키마 정의 및 검증
 ```
 # 공통
 python-dotenv>=1.0.0
+rich>=13.0.0              # CLI 출력 (테이블, 프로그레스바)
 
 # 수집 모듈 (역할 A)
 paramiko>=3.0.0           # SSH 원격 접속 (선택)
