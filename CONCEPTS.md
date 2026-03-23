@@ -644,7 +644,87 @@ with Session(engine) as session:
 
 ---
 
-## 8. 전체 파이프라인 요약
+## 8. 참고 자료 (한국어)
+
+### RAG (검색 증강 생성)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| RAG란 무엇인가? 10분만에 이해하기 | RAG 개념을 빠르게 이해할 수 있는 글 | https://brunch.co.kr/@acc9b16b9f0f430/73 |
+| GPT는 모르면 지어낸다? RAG는 진짜 정보를 찾아온다 | RAG의 필요성과 할루시네이션 해결 설명 | https://www.koreadeep.com/blog/rag |
+| RAG 완벽 가이드: 세 가지 패러다임 | 심화 RAG 아키텍처 정리 | https://brunch.co.kr/@vsongyev/28 |
+| 모두의연구소 - RAG(검색 증강 생성)란? | LLM 단점 보완 기술로서의 RAG | https://modulabs.co.kr/blog/retrieval-augmented-generation |
+| NVIDIA - RAG란? | RAG 작동 원리 상세 설명 | https://blogs.nvidia.co.kr/blog/what-is-retrieval-augmented-generation/ |
+| kt cloud AI - RAG 핵심 개념과 시스템 구조 | 실무 관점 RAG 구조 해설 | https://tech.ktcloud.com/entry/2025-08-ktcloud-ai-rag-시스템구조-이해 |
+
+### LangChain (RAG 프레임워크)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| **테디노트 LangChain 한국어 튜토리얼** | 가장 활발한 한국어 LangChain 튜토리얼. RAG 파이프라인 실습 포함 | https://github.com/teddylee777/langchain-kr |
+| LangChain 한국어 튜토리얼 (WikiDocs) | OpenAI API 연동부터 RAG 구현까지 단계별 실습 | https://wikidocs.net/233342 |
+| LLM 개발기초 - LangChain을 이용한 RAG 구현 | RAG 실습 코드와 설명 | https://hellollama.net/llm-초급강좌-6-langchain-을-이용한-rag-실습/ |
+
+### 임베딩 (Embedding)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| 임베딩(Embedding)이란? | 임베딩 기초 개념 설명 | https://velog.io/@glad415/임베딩Embedding이란 |
+| 워드 임베딩 - 딥 러닝을 이용한 자연어 처리 입문 | 임베딩 원리 상세 설명 (WikiDocs) | https://wikidocs.net/33520 |
+| 에스코어 - 벡터 임베딩 모델의 이해와 활용 | 임베딩 모델 비교 및 선택 가이드 | https://s-core.co.kr/insight/view/벡터-임베딩-모델의-이해와-활용-최적의-임베딩-모델/ |
+| Syncly - Embedding이란 무엇이고 어떻게 사용하는가 | 실무 관점 임베딩 활용법 | https://www.syncly.kr/blog/what-is-embedding-and-how-to-use |
+
+### Milvus (벡터 DB)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| JackerLab - Milvus 벡터 데이터베이스 | Milvus 개념 및 설치 방법 | https://jackerlab.com/milvus/ |
+| Milvus DB 컬렉션 생성하기 | 컬렉션 생성, 데이터 삽입 실습 | https://velog.io/@one_two_three/Milvus-DB-컬렉션-생성-데이터-입력해보기 |
+| SK devocean - Milvus Quick Start | 도입 검토를 위한 빠른 시작 가이드 | https://devocean.sk.com/blog/techBoardDetail.do?ID=165368 |
+| Sionic AI - Vector Database 구축 실습 | 벡터 DB 구축 실습 (Milvus/Chroma) | https://blog.sionic.ai/vector-database-practice |
+| Milvus 공식 문서 (한국어) | Milvus Lite 로컬 실행 가이드 | https://milvus.io/docs/ko/milvus_lite.md |
+
+### OpenAI API (LLM 호출)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| OpenAI API 사용법 총정리 | Python 설치부터 챗봇 만들기까지 | https://www.magicaiprompts.com/docs/gpt-chatbot/openai-api-usage-guide/ |
+| 테디노트 - OpenAI Python API 튜토리얼 | 채팅 함수 사용법 상세 설명 | https://teddylee777.github.io/openai/openai-api-tutorial-01/ |
+| ChatGPT API Python 사용법 | API 키 발급부터 호출까지 | https://wooiljeong.github.io/python/chatgpt-api/ |
+| LangChain 튜토리얼 - OpenAI API 키 발급 및 테스트 | API 키 발급 + 테스트 코드 | https://wikidocs.net/233342 |
+| OpenAI API와 파이썬으로 나만의 챗GPT 만들기 | 도서 예제 코드 (GitHub) | https://github.com/ychoi-kr/ChatGPT-API-Python |
+
+### Python asyncio (비동기/병렬 처리)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| Python 공식 문서 - asyncio (한국어) | 공식 한국어 번역 문서 | https://docs.python.org/ko/3/library/asyncio.html |
+| 테디노트 - 파이썬 비동기 함수와 코루틴 이해하기 | async/await 흐름 설명 | https://teddylee777.github.io/python/python-async/ |
+| Dale Seo - asyncio로 비동기 처리하기 | gather, Semaphore 등 실용 예제 | https://www.daleseo.com/python-asyncio/ |
+| 파이썬 코딩 도장 - asyncio 사용하기 | 초보자용 asyncio 설명 | https://dojang.io/mod/page/view.php?id=2469 |
+| 점프 투 파이썬 - asyncio | 비동기 방식 프로그래밍 기초 | https://wikidocs.net/125092 |
+
+### SQLAlchemy (DB ORM)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| 파이썬 개발자를 위한 SQLAlchemy | SQLAlchemy 2.0 한국어 튜토리얼 (가장 상세) | https://soogoonsoogoonpythonists.github.io/sqlalchemy-for-pythonist/tutorial/ |
+| SQLAlchemy 사용하기 (velog) | 빠른 입문 가이드 | https://velog.io/@baeyuna97/SQLAlchemy-사용하기 |
+| WikiDocs - SQLAlchemy: Python SQL 툴킷 | 기본 사용법 정리 | https://wikidocs.net/226764 |
+
+### 보안 가이드라인 (주통기)
+
+| 자료 | 설명 | 링크 |
+|------|------|------|
+| KISA - 기술적 취약점 분석·평가 상세가이드 | 원본 PDF 다운로드 (필수) | https://www.kisa.or.kr/2060204/form?postSeq=12&lang_type=KO&page=1 |
+| SSV - Unix 시스템 취약점 점검 가이드 | U항목 전체 설명 (웹) | https://ssv.skill.or.kr/ |
+| SSV - Windows 시스템 취약점 점검 가이드 | W항목 전체 설명 (웹) | https://ssv.skill.or.kr/cloud-security/windows-security-vulnerability |
+| GitHub - vulnerability-check | 주통기 기반 Bash 점검 스크립트 (참고용) | https://github.com/catember/vulnerability-check |
+| 토스 - LLM을 이용한 취약점 분석 자동화 | 실무에서 LLM 보안 활용 사례 | https://toss.tech/article/vulnerability-analysis-automation-1 |
+
+---
+
+## 9. 전체 파이프라인 요약
 
 ```
 [1회] 가이드라인 PDF ─→ 파싱 ─→ 청킹 ─→ 임베딩 ─→ Milvus 저장
