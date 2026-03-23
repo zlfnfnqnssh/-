@@ -9,29 +9,42 @@
 | **Docker** | Milvus, DB 등 인프라 실행 | 기본 사용법만 |
 | **가상환경 (venv/conda)** | Python 패키지 관리 | 기본 |
 
-> **UI 방식: CLI (Command Line Interface)**
-> 웹 프레임워크 없이 터미널에서 명령어로 실행하는 방식입니다.
+> **UI 방식: 웹 대시보드 (FastAPI + Jinja2)**
+> 브라우저에서 스크립트 결과 업로드, 판정 실행, 결과 조회, PDF 다운로드 등 모든 기능을 제공합니다.
 
-**CLI 관련 패키지:**
+**웹 프레임워크:**
 ```
-argparse            # 명령어 인자 처리 (기본 내장)
-rich                # 터미널 출력 꾸미기 (테이블, 프로그레스바, 색상)
-click               # CLI 명령어 프레임워크 (argparse 대안, 선택)
+fastapi             # 백엔드 API 서버 (비동기 지원, 병렬 처리와 궁합 좋음)
+uvicorn             # ASGI 서버 (FastAPI 실행)
+jinja2              # HTML 템플릿 렌더링 (서버사이드)
+python-multipart    # 파일 업로드 처리
 ```
 
-**사용 예시:**
-```bash
-# 시스템 정보 수집
-python main.py collect --os linux --target localhost
+**웹 대시보드 주요 페이지:**
 
-# 취약점 판정 실행
-python main.py scan --scan-id scan_20260401_001
+| 페이지 | 기능 |
+|--------|------|
+| **대시보드 (메인)** | 최근 진단 요약, 양호/취약 비율 차트, 빠른 실행 버튼 |
+| **스크립트 결과 업로드** | 수집 스크립트 실행 결과(JSON) 업로드 또는 직접 수집 실행 |
+| **판정 실행** | 업로드된 결과에 대해 RAG+LLM 판정 시작, 실시간 진행률 표시 |
+| **판정 결과 조회** | 항목별 양호/취약 판정 결과 테이블, 필터링/검색 |
+| **항목 상세** | 개별 항목의 수집값, 관련 가이드라인, 판정 이유, 조치 방법 |
+| **리포트** | 보고서 미리보기 + PDF 다운로드 |
+| **비교** | 이전 진단과 현재 진단 비교 (개선/악화/유지) |
+| **진단 이력** | 과거 진단 목록, 각 진단 결과 조회 |
 
-# 리포트 생성
-python main.py report --scan-id scan_20260401_001 --format pdf
-
-# 이전 진단과 비교
-python main.py compare --current scan_20260401_001 --previous scan_20260301_001
+**웹 구조:**
+```
+브라우저 (HTML/CSS/JS)
+    │
+    ▼
+FastAPI 서버 (Python)
+    │
+    ├── 페이지 렌더링 (Jinja2 HTML 템플릿)
+    ├── API 엔드포인트 (/api/scan, /api/judge, /api/report ...)
+    ├── 파일 업로드 처리
+    ├── PDF 생성 및 다운로드
+    └── 백그라운드 작업 (판정 병렬 처리)
 ```
 
 ---
@@ -159,7 +172,12 @@ pydantic              # LLM 출력 스키마 정의 및 검증
 ```
 # 공통
 python-dotenv>=1.0.0
-rich>=13.0.0              # CLI 출력 (테이블, 프로그레스바)
+
+# 웹 서버 (FastAPI + Jinja2)
+fastapi>=0.115.0          # 백엔드 API 서버
+uvicorn>=0.30.0           # ASGI 서버
+jinja2>=3.1.0             # HTML 템플릿 렌더링
+python-multipart>=0.0.9   # 파일 업로드 처리
 
 # 수집 모듈 (역할 A)
 paramiko>=3.0.0           # SSH 원격 접속 (선택)
@@ -174,7 +192,6 @@ tiktoken>=0.7.0           # 토큰 카운트
 # DB & 리포트 (역할 C)
 sqlalchemy>=2.0.0         # ORM
 alembic>=1.13.0           # DB 마이그레이션
-jinja2>=3.1.0             # 템플릿 엔진
 weasyprint>=62.0          # PDF 생성
 matplotlib>=3.9.0         # 차트
 

@@ -99,45 +99,58 @@
 ## 아키텍처 다이어그램
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Linux     │     │   Windows   │     │  주통기 PDF  │
-│   서버/VM   │     │   서버/PC   │     │  가이드라인   │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                    │
-       ▼                   ▼                    ▼
-┌──────────────────────────────┐     ┌──────────────────┐
-│      수집 모듈 (Collectors)   │     │  문서 처리 모듈   │
-│  linux_collector.py          │     │  (Knowledge)     │
-│  windows_collector.py        │     │  parser → chunker│
-│  normalizer.py               │     │  → embedder      │
-└──────────────┬───────────────┘     └────────┬─────────┘
-               │                              │
-               ▼                              ▼
-        ┌─────────────┐              ┌─────────────────┐
-        │     RDB     │              │   Vector DB     │
-        │  (SQLite/   │              │   (Milvus)      │
-        │ PostgreSQL) │              │                 │
-        └──────┬──────┘              └────────┬────────┘
-               │                              │
-               └──────────┬───────────────────┘
-                          │
-                          ▼
-               ┌─────────────────────┐
-               │    판정 엔진         │
-               │  (RAG + LLM)       │
-               │                    │
-               │  rag_search.py     │
-               │  llm_judge.py      │
-               │  pipeline.py       │
-               └─────────┬──────────┘
-                         │
-                         ▼
-               ┌─────────────────────┐
-               │    리포트 생성       │
-               │  generator.py      │
-               │  comparator.py     │
-               └─────────────────────┘
+                     ┌──────────────────────────────────────────────┐
+                     │          웹 대시보드 (브라우저)                 │
+                     │  업로드 / 판정 실행 / 결과 조회 / PDF 다운로드   │
+                     └────────────────────┬─────────────────────────┘
+                                          │ HTTP
+                                          ▼
+                     ┌──────────────────────────────────────────────┐
+                     │         FastAPI 서버 (uvicorn)                │
+                     │  페이지 렌더링 (Jinja2) + REST API            │
+                     │  /api/upload, /api/judge, /api/report ...    │
+                     └────────────────────┬─────────────────────────┘
+                                          │
+          ┌───────────────────────────────┼───────────────────────────────┐
+          │                               │                               │
+          ▼                               ▼                               ▼
+┌──────────────────┐          ┌─────────────────────┐          ┌─────────────────┐
+│   수집 모듈       │          │    판정 엔진         │          │   문서 처리 모듈  │
+│  (Collectors)    │          │  (RAG + LLM)       │          │  (Knowledge)    │
+│ linux_collector  │          │  rag_search.py     │          │  parser/chunker │
+│ windows_collector│          │  llm_judge.py      │          │  embedder       │
+│ normalizer       │          │  pipeline.py       │          │  milvus_loader  │
+└────────┬─────────┘          └─────────┬──────────┘          └────────┬────────┘
+         │                              │                              │
+         ▼                              │                              ▼
+  ┌─────────────┐                       │                    ┌─────────────────┐
+  │     RDB     │◀──────────────────────┘                    │   Vector DB     │
+  │  (SQLite/   │                                            │   (Milvus)      │
+  │ PostgreSQL) │                                            └─────────────────┘
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────────────┐
+  │    리포트 생성       │
+  │  generator.py      │
+  │  comparator.py     │
+  └─────────────────────┘
 ```
+
+### UI 방식: 웹 대시보드 (FastAPI + Jinja2)
+
+브라우저에서 모든 기능을 제공합니다:
+
+| 페이지 | 기능 |
+|--------|------|
+| **대시보드 (메인)** | 최근 진단 요약, 양호/취약 비율 차트, 빠른 실행 버튼 |
+| **스크립트 결과 업로드** | 수집 스크립트 실행 결과(JSON) 업로드 또는 직접 수집 실행 |
+| **판정 실행** | 업로드된 결과에 대해 RAG+LLM 판정 시작, 실시간 진행률 표시 |
+| **판정 결과 조회** | 항목별 양호/취약 판정 결과 테이블, 필터링/검색 |
+| **항목 상세** | 개별 항목의 수집값, 관련 가이드라인, 판정 이유, 조치 방법 |
+| **리포트** | 보고서 미리보기 + PDF 다운로드 |
+| **비교** | 이전 진단과 현재 진단 비교 (개선/악화/유지) |
+| **진단 이력** | 과거 진단 목록, 각 진단 결과 조회 |
 
 ---
 
@@ -145,10 +158,30 @@
 
 ```
 vulnerability-scanner/
-├── main.py                       # 진입점
+├── main.py                       # FastAPI 앱 진입점 (uvicorn 실행)
 ├── requirements.txt
 ├── config/
 │   └── settings.py               # 환경 설정 (DB 경로, API 키, Milvus 주소)
+│
+├── web/                          # [웹 대시보드] FastAPI + Jinja2
+│   ├── routes/                   # API 라우터
+│   │   ├── pages.py              # 페이지 렌더링 (HTML)
+│   │   ├── upload.py             # 스크립트 결과 업로드 API
+│   │   ├── judge.py              # 판정 실행 API
+│   │   └── report.py             # 리포트 조회/다운로드 API
+│   ├── templates/                # Jinja2 HTML 템플릿
+│   │   ├── base.html             # 공통 레이아웃
+│   │   ├── dashboard.html        # 대시보드
+│   │   ├── upload.html           # 업로드 페이지
+│   │   ├── judge.html            # 판정 실행 페이지
+│   │   ├── results.html          # 판정 결과 조회
+│   │   ├── detail.html           # 항목 상세
+│   │   ├── report.html           # 리포트 미리보기
+│   │   ├── compare.html          # 진단 비교
+│   │   └── history.html          # 진단 이력
+│   └── static/                   # 정적 파일
+│       ├── css/style.css
+│       └── js/app.js
 │
 ├── collectors/                   # [역할 A] 시스템 정보 수집
 │   ├── linux_collector.py
@@ -386,9 +419,8 @@ async def run_pipeline(scan_id: str):
     generate_report(scan_id)
 
 
-# 실행
-if __name__ == "__main__":
-    asyncio.run(run_pipeline("scan_20260401_001"))
+# FastAPI 백그라운드 작업에서 호출
+# web/routes/judge.py에서 run_pipeline(scan_id)를 BackgroundTasks로 실행
 ```
 
 ### 병렬 처리 설정 가이드
@@ -405,7 +437,7 @@ if __name__ == "__main__":
 1. **Rate Limit**: OpenAI/Claude API는 분당 요청 수 제한이 있음. Semaphore 값을 API 제한에 맞춰 설정
 2. **DB 동시 쓰기**: SQLite는 동시 쓰기에 약함 → asyncio에서는 단일 스레드이므로 큰 문제 없지만, WAL 모드 활성화 권장
 3. **에러 처리**: 개별 항목 실패가 전체를 중단시키지 않도록 `return_exceptions=True` 사용
-4. **진행률 표시**: tqdm 또는 콜백으로 처리 진행률 표시 가능
+4. **진행률 표시**: 웹 대시보드에서 실시간 진행률 표시 (SSE 또는 폴링)
 
 ---
 
