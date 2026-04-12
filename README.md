@@ -1,143 +1,200 @@
-# AI 기반 시스템 보안 자동 진단 및 취약점 리포팅 시스템
+# AI 기반 취약점 자동 점검 및 자가 조치 웹 플랫폼
 
-> 주요정보통신기반시설(주통기) 보안 가이드라인 기반, RAG + LLM을 활용한 자동 취약점 판정 시스템
+> 주요정보통신기반시설(주통기) 보안 가이드라인 기반, LLM(Gemini)을 활용한 자동 취약점 판정 및 맞춤형 조치 스크립트 제공 웹 플랫폼
 
-## 프로젝트 소개
+## 프로젝트 개요
 
-보안 점검은 여전히 전문 인력이 수작업으로 수행하고 있어 시간과 비용이 많이 들고, 점검자에 따라 결과가 달라지는 문제가 있습니다.
+점검 대상 시스템(Linux/Windows)의 구성 정보를 파악하고, KISA 주통기 가이드라인 최신 버전을 기반으로 컴플라이언스를 점검하는 전 과정을 자동화합니다.
+관리자(Admin) 권한에서는 가이드라인 변경에 따른 점검 스크립트의 자동 업데이트를 수행하며,
+사용자(Users) 권한에서는 클릭 한 번으로 시스템 진단부터 LLM(Gemini) 기반 맞춤형 조치 스크립트 및 설명 생성까지 원스톱으로 제공합니다.
 
-본 프로젝트는 **시스템 보안 점검 전 과정을 자동화**합니다.
-- **웹 대시보드**에서 스크립트 결과 업로드, 판정 실행, 결과 조회, PDF 다운로드
-- 시스템 보안 정보를 **자동 수집**
-- 정부 보안 가이드라인과 **AI가 자동 비교/판정**
-- 문제 항목과 해결 방법을 담은 **보고서 자동 생성**
+## 핵심 기능
 
-## 시스템 아키텍처
+### 1. 보안 가이드라인(PDF) 변경 자동 반영 스크립트 생성 (Admin)
+- 관리자가 새로운 주통기 가이드라인 PDF를 업로드하면 파싱하여 DB에 저장
+- 기존 DB에 저장된 버전과의 변경점(추가/삭제/수정 내역)을 자동으로 도출
+- 변경점에 맞춰 Gemini CLI를 활용해 Linux/Windows 별 취약점 점검 스크립트를 자동 생성 및 업데이트
 
-```
-              ┌─────────────────────────────────────┐
-              │       웹 대시보드 (브라우저)           │
-              │  업로드 / 판정 / 결과 조회 / PDF 저장  │
-              └──────────────────┬──────────────────┘
-                                 │ HTTP
-                                 ▼
-              ┌─────────────────────────────────────┐
-              │      FastAPI 서버 (Jinja2 + API)     │
-              └──────────────────┬──────────────────┘
-                                 │
-       ┌─────────────────────────┼─────────────────────────┐
-       ▼                         ▼                         ▼
-┌─────────────┐       ┌──────────────────┐       ┌──────────────┐
-│  수집 모듈   │       │   RAG + LLM      │       │  주통기 PDF   │
-│ Linux/Win   │       │   판정 엔진       │       │ → Vector DB  │
-└──────┬──────┘       └────────┬─────────┘       └──────────────┘
-       │                       │
-       ▼                       ▼
-┌──────────────┐       ┌──────────────┐
-│    RDB       │       │  보고서 생성  │
-│ (SQLite/PG)  │       │   (PDF)      │
-└──────────────┘       └──────────────┘
-```
+### 2. 사용자 맞춤형 시스템 점검 (Users)
+- UUID 기반의 개별 사용자 계정을 DB로 분리, 접속 및 지속적인 이력 관리
+- '점검 시작' 버튼 클릭 시 대상 시스템 OS(Linux/Windows) 자동 판단 후 해당 점검 스크립트 실행
+- 실행 결과를 임시 JSON으로 반환, 판정 완료 즉시 파기
 
-## 파이프라인 흐름
+### 3. LLM (Gemini) 기반 지능형 판정 & 분석
+- **양호(규칙 기반 판정 가능 항목):** 여러 항목을 묶어 일괄 LLM 처리 (Batch)
+- **취약/판정 불가:** 개별 건을 병렬(Parallel)로 전송하여 빠른 결과 확보
+- 판정 결과: 쉬운 설명, 공격 시나리오, 가이드라인 기반 조치 방법, 즉시 실행 가능한 패치 스크립트
 
-| 단계 | 설명 | 비고 |
+### 4. 시계열 점검 비교 추이 시각화
+- 과거 점검 이력과 현재 결과를 자동 대조
+- "여전히 취약", "새로 취약", "양호로 전환" 등 상태 변화를 웹에서 시각화
+
+---
+
+## 점검 항목 현황
+
+| OS | 항목 범위 | 스크립트 수 |
+|----|-----------|------------|
+| Linux (Unix) | U-01 ~ U-72 | 56개 |
+| Windows | W-01 ~ W-47 | 32개 |
+| **합계** | | **88개** |
+
+---
+
+## 설치 및 실행 방법
+
+### 사전 요구사항
+
+| 구분 | 버전 | 비고 |
 |------|------|------|
-| **1. 지식 기반 구축** | 주통기 가이드라인 PDF → 청킹 → 임베딩 → Milvus 저장 | 사전 1회 수행 |
-| **2. 시스템 정보 수집** | Linux/Windows 보안 정보 자동 수집 → DB 저장 | Python + Shell/PowerShell |
-| **3. RAG + LLM 판정** | 수집 항목 임베딩 → VDB 검색 → LLM 양호/취약 판정 | **병렬 처리 (asyncio)** |
-| **4. 리포트 생성** | 판정 결과 → PDF/HTML 보고서 자동 생성 | 이전 진단 비교 포함 |
+| Python | 3.10 이상 | |
+| Node.js | 18 이상 | Gemini CLI (npx) 실행용 |
+| PostgreSQL | 14 이상 | Docker 컨테이너 권장 |
+| Docker | 최신 | PostgreSQL 실행용 |
 
-### 병렬 처리
+### 1. 저장소 클론
 
-LLM API 호출이 병목이므로 `asyncio` + `Semaphore`로 여러 항목을 동시 처리합니다.
-
-```
-순차: 119개 항목 × 5초 = ~11분
-병렬: 동시 10개 처리  = ~1분
+```bash
+git clone https://github.com/zlfnfnqnssh/-.git
+cd 취약점진단/vulnerability-scanner
 ```
 
-## 점검 대상
+### 2. Python 패키지 설치
 
-| 구분 | 기준 | 항목 수 |
-|------|------|---------|
-| **Unix/Linux 서버** | 주통기 U-01 ~ U-72 | 72개 |
-| **Windows 서버** | 주통기 W-01 ~ W-84 | 47개 (PC 적용 가능) |
+```bash
+pip install -r requirements.txt
+```
 
-점검 분류: 계정 관리, 파일/디렉토리 관리, 서비스 관리, 패치 관리, 로그 관리, 보안 관리
+주요 패키지:
+- `fastapi`, `uvicorn`, `jinja2` — 웹 서버
+- `sqlalchemy`, `asyncpg` — PostgreSQL 비동기 ORM
+- `pymupdf` — PDF 파싱
+- `passlib[bcrypt]`, `itsdangerous` — 인증
+- `reportlab`, `matplotlib` — PDF 보고서 생성
+- `pydantic` — 데이터 검증
+- `python-dotenv` — 환경변수 관리
+
+### 3. Gemini CLI 설치
+
+```bash
+npm install -g @google/gemini-cli
+```
+
+또는 npx를 통해 자동 설치됩니다 (첫 실행 시 다운로드).
+
+### 4. PostgreSQL (Docker)
+
+```bash
+docker run -d \
+  --name postgres-db \
+  -e POSTGRES_PASSWORD=admin123 \
+  -e POSTGRES_DB=forensic_db \
+  -p 5432:5432 \
+  postgres:14
+```
+
+### 5. 환경변수 설정
+
+`vulnerability-scanner/.env` 파일 생성:
+
+```env
+# PostgreSQL
+PG_HOST=localhost
+PG_PORT=5432
+PG_USER=postgres
+PG_PASSWORD=admin123
+PG_DB=forensic_db
+
+# Gemini CLI
+GEMINI_CLI_CMD=npx @google/gemini-cli
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_TIMEOUT=120
+
+# 병렬 처리
+MAX_CONCURRENT=5
+```
+
+### 6. 서버 실행
+
+```bash
+cd vulnerability-scanner
+python main.py
+```
+
+또는:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 7. 웹 접속
+
+- 대시보드: http://localhost:8000
+- 관리자 페이지: http://localhost:8000/admin
+- 기본 관리자 계정: `admin` / `admin1234`
+
+---
 
 ## 기술 스택
 
 | 구분 | 기술 |
 |------|------|
 | 언어 | Python 3.10+ |
-| 수집 | subprocess, PowerShell |
-| RDB | SQLite → PostgreSQL |
-| Vector DB | Milvus |
-| 임베딩 | OpenAI `text-embedding-3-small` / HuggingFace |
-| LLM | GPT-4o / Claude |
-| RAG | LangChain |
-| 웹 UI | FastAPI + Jinja2 (웹 대시보드) |
-| 리포트 | Jinja2 + WeasyPrint |
+| LLM | Gemini CLI (`npx @google/gemini-cli`) |
+| RDB | PostgreSQL (Docker, DB: forensic_db) |
+| 웹 프레임워크 | FastAPI + Jinja2 (SSR) |
+| ASGI 서버 | uvicorn |
+| UI | Bootstrap 5 + Bootstrap Icons |
+| PDF 파싱 | PyMuPDF |
+| PDF 보고서 | ReportLab + matplotlib |
+| 비동기 | asyncio + SQLAlchemy async + asyncpg |
+| 인증 | bcrypt + 세션 기반 |
 
-## 프로젝트 구조
+---
+
+## 디렉토리 구조
 
 ```
 vulnerability-scanner/
-├── main.py                  # FastAPI 앱 진입점
-├── config/settings.py       # 환경 설정
-├── web/                     # 웹 대시보드
-│   ├── routes/              # FastAPI 라우터
-│   ├── templates/           # Jinja2 HTML 템플릿
-│   └── static/              # CSS, JS
-├── collectors/              # 시스템 정보 수집
-│   ├── linux_collector.py
-│   ├── windows_collector.py
-│   └── normalizer.py
-├── knowledge/               # 가이드라인 & VDB
-│   ├── document_parser.py
-│   ├── chunker.py
-│   ├── embedder.py
-│   └── milvus_loader.py
-├── database/                # DB 관리
-│   ├── models.py
-│   └── repository.py
-├── engine/                  # RAG + LLM 판정
-│   ├── rag_search.py
-│   ├── llm_judge.py
-│   └── pipeline.py
-└── report/                  # 리포트 생성
-    ├── generator.py
-    ├── comparator.py
-    └── templates/
+├── main.py                      # FastAPI 앱 진입점 (포트 8000)
+├── requirements.txt             # Python 패키지
+├── .env                         # 환경변수 (git 미추적)
+├── config/
+│   └── settings.py              # 환경 설정
+├── auth/
+│   └── session.py               # 세션/인증 미들웨어
+├── scripts/
+│   ├── windows/                 # W-01 ~ W-47 점검 스크립트 (32개)
+│   └── linux/                   # U-01 ~ U-72 점검 스크립트 (56개)
+├── knowledge/
+│   ├── guideline_extractor.py   # PDF → DB 파싱
+│   ├── guideline_differ.py      # 가이드라인 버전 비교
+│   └── data/
+│       ├── guidelines/          # 가이드라인 PDF
+│       └── uploads/             # 관리자 업로드 PDF
+├── engine/
+│   ├── llm_judge.py             # Gemini CLI LLM 판정
+│   ├── pipeline.py              # 3단계 스마트 판정 파이프라인
+│   ├── script_generator.py      # LLM 기반 스크립트 자동 생성
+│   └── comparison.py            # 점검 이력 비교
+├── database/
+│   ├── models.py                # SQLAlchemy 비동기 모델 (vs_ 접두사)
+│   └── repository.py            # 비동기 CRUD
+├── report/
+│   ├── generator.py             # ReportLab PDF 보고서 생성
+│   └── comparator.py            # 이전 진단 비교
+└── web/
+    ├── routes/
+    │   ├── pages.py             # 페이지 라우터
+    │   ├── scan.py              # 스캔 API
+    │   ├── admin.py             # 관리자 API
+    │   ├── auth.py              # 인증 API
+    │   └── patch.py             # 패치 실행 API
+    ├── templates/               # Jinja2 HTML 템플릿
+    └── static/                  # CSS, JS
 ```
 
-## 팀 구성
+---
 
-| 구분 | 이름 | 담당 |
-|------|------|------|
-| 팀장 | 이서연 | Linux 수집 스크립트 |
-| 팀원 | 강지혁 | Windows 수집 스크립트 |
-| 팀원 | 고은이 | RAG 파이프라인 + VDB 구축 |
-| 팀원 | 백서진 | DB 설계 + 웹 대시보드 + 리포트 |
-
-> 중부대학교 정보보호학과 | 2026-1 캡스톤디자인 | 취약점 진단 및 평가 | 양환석 교수
-
-## 문서
-
-| 파일 | 내용 |
-|------|------|
-| [PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md) | 파이프라인, 아키텍처, 병렬처리 설계 |
-| [TEAM_ROLES.md](TEAM_ROLES.md) | 필요 역할 4개 상세 |
-| [TECH_STACK.md](TECH_STACK.md) | 역할별 기술 및 패키지 |
-| [주통기_Unix서버_점검항목.md](주통기_Unix서버_점검항목.md) | U-01~U-72 점검항목 |
-| [주통기_Windows서버_점검항목.md](주통기_Windows서버_점검항목.md) | W항목 + PC항목 |
-
-## 일정
-
-| 월 | 주요 활동 |
-|----|---------|
-| 3월 | 요구사항 분석 / 설계 / 가이드라인 분석 |
-| 4월 | 수집 스크립트 / DB 구축 / VDB 구축 |
-| 5월 | RAG 검색 / LLM 판정 파이프라인 |
-| 6월 | 리포트 생성 / 통합 테스트 / 완성 |
+## 향후 확장 과제
+- 한 명의 사용자가 여러 개의 서로 다른 로컬 OS를 운용하는 경우를 DB에 구조적으로 포함하고 관리할 수 있도록 개선
