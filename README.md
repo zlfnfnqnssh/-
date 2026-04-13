@@ -84,6 +84,14 @@ npm install -g @google/gemini-cli
 
 ### 4. PostgreSQL (Docker)
 
+프로젝트 루트에 `docker-compose.yml`이 포함되어 있어 한 줄로 실행 가능:
+
+```bash
+docker compose up -d
+```
+
+또는 수동으로:
+
 ```bash
 docker run -d \
   --name postgres-db \
@@ -95,24 +103,14 @@ docker run -d \
 
 ### 5. 환경변수 설정
 
-`vulnerability-scanner/.env` 파일 생성:
+`.env.example`을 복사하여 `.env` 파일 생성:
 
-```env
-# PostgreSQL
-PG_HOST=localhost
-PG_PORT=5432
-PG_USER=postgres
-PG_PASSWORD=admin123
-PG_DB=forensic_db
-
-# Gemini CLI
-GEMINI_CLI_CMD=npx @google/gemini-cli
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_TIMEOUT=120
-
-# 병렬 처리
-MAX_CONCURRENT=5
+```bash
+cd vulnerability-scanner
+cp .env.example .env
 ```
+
+필요 시 `.env` 내용 수정 (PostgreSQL 비밀번호, Gemini 모델 등)
 
 ### 6. 서버 실행
 
