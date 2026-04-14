@@ -1,0 +1,85 @@
+import subprocess
+import json
+import sys
+
+# Windows에서 출력 인코딩 문제 방지
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+def check():
+    category = "계정 관리"
+    item_code = "W-09"
+    item_name = "비밀번호 관리 정책 설정"
+
+    cmd_str = r'''net accounts'''
+
+    try:
+        # 실행 명령어 구성
+        cmd = ["powershell", "-NoProfile", "-Command", cmd_str]
+
+        def _dec(b):
+            if b.startswith(b'\xff\xfe'): return b.decode('utf-16-le', errors='replace')
+            if b.startswith(b'\xfe\xff'): return b.decode('utf-16-be', errors='replace')
+            try: return b.decode('utf-8')
+            except UnicodeDecodeError: return b.decode('cp949', errors='replace')
+        result = subprocess.run(
+            cmd, capture_output=True, check=False,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        out = _dec(result.stdout).strip()
+        err = _dec(result.stderr).strip()
+
+        # 종합 출력 덤프
+        full_out = out if out else err
+
+        # 규칙 기반 판정
+        result = "규칙불가"
+        if full_out:
+            import re
+            min_len_m = re.search(r'(?:Minimum password length|최소.*암호.*길이)\s*[:\s]+(\S+)', full_out, re.IGNORECASE)
+            max_age_m = re.search(r'(?:Maximum password age|최대.*암호.*사용.*기간)\s*[:\s]+(\S+)', full_out, re.IGNORECASE)
+            hist_m = re.search(r'(?:Length of password history|암호.*기록.*보관)\s*[:\s]+(\S+)', full_out, re.IGNORECASE)
+            if min_len_m and max_age_m and hist_m:
+                try:
+                    min_len = int(min_len_m.group(1))
+                    max_age_val = max_age_m.group(1)
+                    hist = int(hist_m.group(1))
+                    len_ok = min_len >= 8
+                    hist_ok = hist >= 1
+                    if max_age_val.lower() == "unlimited" or max_age_val.lower() == "never":
+                        age_ok = False
+                    else:
+                        max_age = int(max_age_val)
+                        age_ok = max_age <= 90
+                    if len_ok and age_ok and hist_ok:
+                        result = "양호"
+                    else:
+                        result = "취약"
+                except ValueError:
+                    pass
+
+        output = {
+            "category": category,
+            "item_code": item_code,
+            "item_name": item_name,
+            "result": result,
+            "collected_value": full_out if full_out else "명령어 실행 결과 없음/해당 설정 없음",
+            "raw_output": full_out,
+            "source_command": cmd_str
+        }
+        print(json.dumps(output, ensure_ascii=False))
+
+    except Exception as e:
+        output = {
+            "category": category,
+            "item_code": item_code,
+            "item_name": item_name,
+            "result": "규칙불가",
+            "collected_value": f"코드 실행 중 앱단 오류 발생: {str(e)}",
+            "raw_output": "",
+            "source_command": cmd_str
+        }
+        print(json.dumps(output, ensure_ascii=False))
+
+if __name__ == "__main__":
+    check()
