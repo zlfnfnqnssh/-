@@ -1,0 +1,72 @@
+[
+  {
+    "item_code": "W-41",
+    "item_name": "NTP 및 시각 동기화 설정",
+    "importance": "중",
+    "criteria": "양호 : NTP 및 시각 동기화를 설정한 경우\n취약 : NTP 및 시각 동기화를 설정하지 않은 경우",
+    "remediation_guide": "NTP 및 시각 동기화 설정"
+  },
+  {
+    "item_code": "W-42",
+    "item_name": "이벤트 로그 관리 설정",
+    "importance": "하",
+    "criteria": "양호 : 최대 로그 크기 “10,240KB 이상”으로 설정, “90일 이후 이벤트 덮어씀”을 설정한 경우\n취약 : 최대 로그 크기 “10,240KB 미만”으로 설정, 이벤트 덮어씀 기간이 “90일 이하로 설정된 경우",
+    "remediation_guide": "최대 로그 크기 “10,204KB”, “90일 이후 이벤트 덮어씀” 설정"
+  },
+  {
+    "item_code": "W-43",
+    "item_name": "이벤트 로그 파일 접근 통제 설정",
+    "importance": "중",
+    "criteria": "양호 : 로그 디렉터리의 접근 권한에 Everyone 권한이 없는 경우\n취약 : 로그 디렉터리의 접근 권한에 Everyone 권한이 있는 경우",
+    "remediation_guide": "로그 디렉터리의 접근 권한에 Everyone 제거"
+  },
+  {
+    "item_code": "W-44",
+    "item_name": "원격으로 액세스할 수 있는 레지스트리 경로",
+    "importance": "상",
+    "criteria": "양호 : Remote Registry Service가 중지된 경우\n취약 : Remote Registry Service가 사용 중인 경우",
+    "remediation_guide": "불필요 시 서비스 중지 및 사용 안 함으로 설정"
+  },
+  {
+    "item_code": "W-45",
+    "item_name": "백신 프로그램 설치",
+    "importance": "상",
+    "criteria": "양호 : 바이러스 백신 프로그램이 설치된 경우\n취약 : 바이러스 백신 프로그램이 설치되어 있지 않은 경우",
+    "remediation_guide": "백신 프로그램 설치"
+  },
+  {
+    "item_code": "W-46",
+    "item_name": "SAM 파일 접근 통제 설정",
+    "importance": "상",
+    "criteria": "양호 : SAM 파일 접근 권한에 Administrator, System 그룹만 모든 권한으로 설정된 경우\n취약 : SAM 파일 접근 권한에 Administrator, System 그룹 외 다른 그룹에 권한이 설정된 경우",
+    "remediation_guide": "SAM 파일 권한 확인 후 Administrator, System 그룹 외 다른 그룹에 설정된 권한 제거"
+  },
+  {
+    "item_code": "W-47",
+    "item_name": "화면 보호기 설정",
+    "importance": "하",
+    "criteria": "양호 : 화면 보호기를 설정하고 대기 시간이 10분 이하의 값으로 설정되어 있으며, 화면 보호기 해제를\n위한 암호를 사용하는 경우\n취약 : 화면 보호기가 설정되지 않았거나 암호를 사용하지 않거나, 화면 보호기 대기 시간이 10분을\n초과한 값으로 설정된 경우",
+    "remediation_guide": "화면 보호기 사용, 대기 시간 10분 이하, 해제를 위한 암호 사용"
+  },
+  {
+    "item_code": "W-48",
+    "item_name": "로그온하지 않고 시스템 종료 허용",
+    "importance": "상",
+    "criteria": "양호 : “로그온하지 않고 시스템 종료 허용”이 “사용 안 함”으로 설정된 경우\n취약 : “로그온하지 않고 시스템 종료 허용”이 “사용”으로 설정된 경우",
+    "remediation_guide": "“시스템 종료: 로그온하지 않고 시스템 종료” 정책을 “사용 안 함” 설정"
+  },
+  {
+    "item_code": "W-49",
+    "item_name": "원격 시스템에서 강제로 시스템 종료",
+    "importance": "상",
+    "criteria": "양호 : “원격 시스템에서 강제로 시스템 종료” 정책에 “Administrators”만 존재하는 경우\n취약 : “원격 시스템에서 강제로 시스템 종료” 정책에 “Administrators” 외 다른 계정 및 그룹이 존재하\n는 경우",
+    "remediation_guide": "“원격 시스템에서 강제로 시스템 종료” 정책에 “Administrators” 외 다른 계정 및 그룹 제거"
+  },
+  {
+    "item_code": "W-50",
+    "item_name": "보안 감사를 로그 할 수 없는 경우 즉시 시스템 종료",
+    "importance": "상",
+    "criteria": "양호 : “보안 감사를 로그 할 수 없는 경우 즉시 시스템 종료” 정책이 “사용 안 함”으로 되어있는 경우\n취약 : “보안 감사를 로그 할 수 없는 경우 즉시 시스템 종료” 정책이 “사용”으로 되어있는 경우",
+    "remediation_guide": "“보안 감사를 로그 할 수 없는 경우 즉시 시스템 종료” 정책을 “사용 안 함”으로 설정"
+  }
+]
