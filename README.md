@@ -1,6 +1,9 @@
 # AI 기반 취약점 자동 점검 및 자가 조치 웹 플랫폼
 
 > 주요정보통신기반시설(주통기) 보안 가이드라인 기반, LLM(Gemini)을 활용한 자동 취약점 판정 및 맞춤형 조치 스크립트 제공 웹 플랫폼
+> 중부대학교 정보보호학과 2026-1 캡스톤디자인
+
+---
 
 ## 프로젝트 개요
 
@@ -8,26 +11,49 @@
 관리자(Admin) 권한에서는 가이드라인 변경에 따른 점검 스크립트의 자동 업데이트를 수행하며,
 사용자(Users) 권한에서는 클릭 한 번으로 시스템 진단부터 LLM(Gemini) 기반 맞춤형 조치 스크립트 및 설명 생성까지 원스톱으로 제공합니다.
 
+> **판정 방식**: 가이드라인을 사전 임베딩하는 RAG 방식이 아니라, **PostgreSQL `vs_guideline_items` 테이블에서 항목별 `criteria + remediation_guide + check_examples`를 LLM 프롬프트에 직접 주입**하는 방식입니다. 항목코드(item_code)로 1:1 직접 조회 가능하므로 벡터 검색이 불필요하고, 토큰 효율과 정확성이 더 높습니다.
+
+---
+
 ## 핵심 기능
 
 ### 1. 보안 가이드라인(PDF) 변경 자동 반영 스크립트 생성 (Admin)
 - 관리자가 새로운 주통기 가이드라인 PDF를 업로드하면 파싱하여 DB에 저장
-- 기존 DB에 저장된 버전과의 변경점(추가/삭제/수정 내역)을 자동으로 도출
-- 변경점에 맞춰 Gemini CLI를 활용해 Linux/Windows 별 취약점 점검 스크립트를 자동 생성 및 업데이트
+- 기존 DB 버전과의 변경점(추가/삭제/수정) 자동 도출
+- 변경점에 맞춰 Gemini CLI로 Linux/Windows 별 점검 스크립트 자동 생성·갱신
 
 ### 2. 사용자 맞춤형 시스템 점검 (Users)
-- UUID 기반의 개별 사용자 계정을 DB로 분리, 접속 및 지속적인 이력 관리
-- '점검 시작' 버튼 클릭 시 대상 시스템 OS(Linux/Windows) 자동 판단 후 해당 점검 스크립트 실행
-- 실행 결과를 임시 JSON으로 반환, 판정 완료 즉시 파기
+- **machine_id 기반 scan_id**: Windows `wmic csproduct UUID` / Linux `/etc/machine-id` 활용
+  - 같은 PC·사용자·OS는 prefix 공유 → 이력 추적 가능
+  - 형식: `{os}_{machine_id}_{user_short}_{timestamp}`
+- '점검 시작' 클릭 시 OS 자동 판단 → 점검 스크립트 실행 → 임시 JSON 반환 → 판정 후 파기
 
-### 3. LLM (Gemini) 기반 지능형 판정 & 분석
-- **양호(규칙 기반 판정 가능 항목):** 여러 항목을 묶어 일괄 LLM 처리 (Batch)
-- **취약/판정 불가:** 개별 건을 병렬(Parallel)로 전송하여 빠른 결과 확보
-- 판정 결과: 쉬운 설명, 공격 시나리오, 가이드라인 기반 조치 방법, 즉시 실행 가능한 패치 스크립트
+### 3. LLM (Gemini) 지능형 판정 파이프라인
+- **양호(규칙 기반):** 여러 항목 묶어 일괄 LLM 검증 (Batch)
+- **취약/판정불가:** 개별 병렬 전송 (Parallel)
+- **판정 정책**:
+  - "판정불가" 반환 차단 → 항상 양호/취약 둘 중 하나
+  - 불확실하면 보수적으로 **취약** (False Negative 방지)
+  - 취약 reason 4가지 필수: 현재 상태 / 안전한 상태 / 왜 위험 / 악용 시 피해 (4~6문장)
+  - 양호 reason 2~3문장 + scenario·remediation 상세화
+- **가이드라인 DB 직접 주입** (RAG 아님): PostgreSQL `vs_guideline_items`에서 항목별 `criteria + remediation_guide + check_examples` 프롬프트에 포함
 
-### 4. 시계열 점검 비교 추이 시각화
-- 과거 점검 이력과 현재 결과를 자동 대조
-- "여전히 취약", "새로 취약", "양호로 전환" 등 상태 변화를 웹에서 시각화
+### 4. UAC 패치 자동 실행 + Gemini 재작성 루프
+- 판정 결과의 `patch_script`를 **UAC 자동 승격**(`Start-Process -Verb RunAs`) 으로 실행
+- 실행 실패 시 Gemini가 (현재 스크립트 + stderr + criteria + remediation_guide + check_examples) 받아 **자동 재작성**
+- 최대 3회 재시도, 성공 시 DB `patch_script` 자동 갱신
+
+### 5. PDF 보고서 자동 생성 & 다운로드
+- 스캔 완료 시 ReportLab + matplotlib로 PDF 자동 생성
+- 표지 / 양호·취약 비율 차트 / 항목별 상세 / 조치 방법 / 부록 구성
+- `GET /report/{scan_id}/download` 로 다운로드
+
+### 6. 시계열 점검 비교 시각화
+- 과거 이력과 자동 대조 — "여전히 취약 / 새로 취약 / 양호 전환" 상태 시각화
+
+### 7. 통합 진행률 표시
+- UAC 대기 → 스크립트 실행 중(0% 고정) → LLM 판정(0~100%)
+- 퍼센트는 LLM 처리 진행률만 반영해 사용자 체감과 일치
 
 ---
 
@@ -35,9 +61,17 @@
 
 | OS | 항목 범위 | 스크립트 수 |
 |----|-----------|------------|
-| Linux (Unix) | U-01 ~ U-72 | 56개 |
-| Windows | W-01 ~ W-47 | 32개 |
-| **합계** | | **88개** |
+| Linux (Unix) | U-01 ~ U-67 | **67개** |
+| Windows Server | W-01 ~ W-64 | **64개** |
+| Windows PC | PC-01 ~ PC-18 | **18개** |
+| **합계** | | **149개** |
+
+### Windows 판정 분포 (82개 기준 / 2026-04-27)
+| 분류 | 개수 | 비율 |
+|---|:-:|:-:|
+| 🟢 양호 확정 (스크립트 직접 판정) | 43 | 52% |
+| 🔴 취약 확정 (스크립트 직접 판정) | 26 | 32% |
+| 🟡 규칙불가 (LLM 판정 위임) | 13 | 16% |
 
 ---
 
@@ -119,12 +153,6 @@ cd vulnerability-scanner
 python main.py
 ```
 
-또는:
-
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
 ### 7. 웹 접속
 
 - 대시보드: http://localhost:8000
@@ -138,8 +166,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 | 구분 | 기술 |
 |------|------|
 | 언어 | Python 3.10+ |
-| LLM | Gemini CLI (`npx @google/gemini-cli`) |
-| RDB | PostgreSQL (Docker, DB: forensic_db) |
+| LLM | Gemini CLI (`npx @google/gemini-cli`, `gemini-2.5-flash`) |
+| RDB | PostgreSQL (Docker, DB: `forensic_db`, `vs_*` 8개 테이블) |
 | 웹 프레임워크 | FastAPI + Jinja2 (SSR) |
 | ASGI 서버 | uvicorn |
 | UI | Bootstrap 5 + Bootstrap Icons |
@@ -147,6 +175,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 | PDF 보고서 | ReportLab + matplotlib |
 | 비동기 | asyncio + SQLAlchemy async + asyncpg |
 | 인증 | bcrypt + 세션 기반 |
+| 수집 스크립트 | PowerShell (Windows) / Bash (Linux) |
+| 권한 상승 | UAC (`Start-Process -Verb RunAs` + Base64 인코딩) / sudo |
+
+> 🚫 **사용 안 하는 기술** (혼동 방지)
+> - Vector DB (Milvus 등) — 가이드라인은 PostgreSQL에 직접 저장
+> - 임베딩 모델 (sentence-transformers 등) — 항목코드 1:1 매핑이라 불필요
+> - RAG 검색 — 프롬프트에 가이드라인을 직접 주입
 
 ---
 
@@ -158,41 +193,67 @@ vulnerability-scanner/
 ├── requirements.txt             # Python 패키지
 ├── .env                         # 환경변수 (git 미추적)
 ├── config/
-│   └── settings.py              # 환경 설정
+│   ├── settings.py              # 환경 설정
+│   └── machine_id.py            # PC 고유 ID + scan_id 빌더
 ├── auth/
-│   └── session.py               # 세션/인증 미들웨어
+│   └── security.py              # 세션 기반 인증
 ├── scripts/
-│   ├── windows/                 # W-01 ~ W-47 점검 스크립트 (32개)
-│   └── linux/                   # U-01 ~ U-72 점검 스크립트 (56개)
+│   ├── windows/                 # W-01~W-64, PC-01~PC-18 (총 82개)
+│   └── linux/                   # U-01~U-67 (67개)
 ├── knowledge/
-│   ├── guideline_extractor.py   # PDF → DB 파싱
-│   ├── guideline_differ.py      # 가이드라인 버전 비교
+│   ├── document_parser.py       # PDF 텍스트 추출 (PyMuPDF)
+│   ├── guideline_extractor.py   # 항목코드별 구조화 파싱
+│   ├── guideline_differ.py      # 가이드라인 버전 비교 (add/mod/del)
+│   ├── load_guidelines.py       # PostgreSQL 적재 스크립트
 │   └── data/
-│       ├── guidelines/          # 가이드라인 PDF
+│       ├── guidelines/          # 가이드라인 PDF 원본
+│       ├── extracted/           # 파싱 결과 JSON
 │       └── uploads/             # 관리자 업로드 PDF
 ├── engine/
-│   ├── llm_judge.py             # Gemini CLI LLM 판정
-│   ├── pipeline.py              # 3단계 스마트 판정 파이프라인
-│   ├── script_generator.py      # LLM 기반 스크립트 자동 생성
+│   ├── llm_judge.py             # Gemini CLI 판정 + 정책 강화
+│   ├── pipeline.py              # 3분류 스마트 파이프라인
+│   ├── script_generator.py      # 신규 항목 스크립트 자동 생성
 │   └── comparison.py            # 점검 이력 비교
 ├── database/
-│   ├── models.py                # SQLAlchemy 비동기 모델 (vs_ 접두사)
+│   ├── models.py                # SQLAlchemy 비동기 모델 (vs_* 8개 테이블)
 │   └── repository.py            # 비동기 CRUD
 ├── report/
-│   ├── generator.py             # ReportLab PDF 보고서 생성
+│   ├── generator.py             # ReportLab PDF 자동 생성
 │   └── comparator.py            # 이전 진단 비교
 └── web/
     ├── routes/
     │   ├── pages.py             # 페이지 라우터
-    │   ├── scan.py              # 스캔 API
-    │   ├── admin.py             # 관리자 API
-    │   ├── auth.py              # 인증 API
-    │   └── patch.py             # 패치 실행 API
-    ├── templates/               # Jinja2 HTML 템플릿
-    └── static/                  # CSS, JS
+    │   ├── scan.py              # 스캔 시작·진행률·비교 API
+    │   ├── admin.py             # 관리자 API (PDF 업로드 등)
+    │   ├── auth.py              # 로그인/회원가입
+    │   ├── patch.py             # UAC 패치 실행 + Gemini 재작성 루프
+    │   ├── report.py            # PDF 리포트 API
+    │   ├── judge.py             # 판정 트리거 (deprecated, 자동화됨)
+    │   └── upload.py            # 수동 업로드 (deprecated)
+    ├── templates/               # Jinja2 HTML 템플릿 (15개)
+    └── static/                  # CSS, JS, 이미지
 ```
 
 ---
 
+## 데이터베이스 스키마 (vs_* 8개 테이블)
+
+| 테이블 | 역할 |
+|---|---|
+| `vs_users` | 사용자/관리자 계정 (bcrypt) |
+| `vs_guideline_versions` | 주통기 가이드라인 버전 이력 |
+| `vs_guideline_items` | 항목별 criteria/remediation/examples (149건) |
+| `vs_guideline_diffs` | 버전 간 add/mod/del 차이 |
+| `vs_script_registry` | 점검 스크립트 메타정보 |
+| `vs_scan_results` | 수집 결과 (item별 collected_value) |
+| `vs_judgments` | LLM 판정 결과 (양호/취약, reason, patch_script) |
+| `vs_comparisons` | 이전 진단과 비교 (개선/악화/유지) |
+
+---
+
 ## 향후 확장 과제
-- 한 명의 사용자가 여러 개의 서로 다른 로컬 OS를 운용하는 경우를 DB에 구조적으로 포함하고 관리할 수 있도록 개선
+
+- 한 사용자가 서로 다른 로컬 OS 여러 대를 운용하는 케이스를 DB 구조에 정식 반영
+- Linux 패치 스크립트 sudo 자동 실행 + Gemini 재작성 루프 검증
+- 신규 PDF 가이드라인 → Gemini로 점검 스크립트 자동 생성 루프 완성
+- LLM 판정 정확도 벤치마크 및 회귀 테스트
