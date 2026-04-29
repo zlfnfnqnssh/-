@@ -14,8 +14,8 @@ from .scripts_db import DiagnosisRepository
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DSN   = "postgresql://admin:admin123@localhost:5432/jtk_db"
-SCRIPTS_ROOT  = Path(__file__).parent.parent / "scripts"
+DEFAULT_DSN  = "postgresql://admin:admin123@localhost:5432/jtk_db"
+SCRIPTS_ROOT = Path(__file__).parent.parent / "scripts"
 
 
 class ScriptExecutor:
@@ -43,7 +43,9 @@ class ScriptExecutor:
 
         사용 예:
             executor = ScriptExecutor()
-            session_id = executor.run(os_type="windows", prefix="PC")
+            session_id = executor.run(os_type="windows")        # W + PC 전체
+            session_id = executor.run(os_type="windows", prefix="PC")  # PC만
+            session_id = executor.run(os_type="linux")          # U 전체
         """
         started_at = datetime.now(timezone.utc)
 
@@ -103,25 +105,29 @@ class ScriptExecutor:
         category: str,
         severity: str,
     ) -> list[str]:
-        """주통기 DB에서 조건에 맞는 코드 목록 조회"""
+        """
+        주통기 DB에서 조건에 맞는 코드 목록 조회.
+        prefix 미지정 시 os_type으로 필터.
+        (os_type=windows → W + PC 둘 다 포함)
+        """
         conditions: list[str] = []
         params: list[str] = []
 
         if prefix:
             conditions.append("prefix = %s")
             params.append(prefix)
+        else:
+            conditions.append("os_type = %s")
+            params.append(os_type)
+
         if category:
             conditions.append("category ILIKE %s")
             params.append(f"%{category}%")
         if severity:
             conditions.append("severity = %s")
             params.append(severity)
-        if not prefix:
-            # prefix 미지정 시 os_type 기반 자동 필터
-            conditions.append("os_type = %s")
-            params.append(os_type)
 
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        where = "WHERE " + " AND ".join(conditions)
         sql = f"SELECT code FROM vulnerabilities {where} ORDER BY code"
 
         with psycopg.connect(self.dsn, row_factory=dict_row) as conn:
@@ -169,7 +175,7 @@ class ScriptExecutor:
             logger.error("[Executor] 실행 오류: %s | %s", code, e)
             return self._error_result(code, f"실행 오류: {e}")
 
-        raw = proc.stdout.strip()
+        raw  = proc.stdout.strip()
         text = self._decode(raw)
 
         if not text:
@@ -211,8 +217,14 @@ class ScriptExecutor:
             except UnicodeDecodeError:
                 continue
         return raw.decode("utf-8", errors="replace")
-    
+
+
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
     executor = ScriptExecutor()
-    session_id = executor.run(os_type="windows", prefix="PC")
+    # prefix 미지정 → os_type=windows 기반 전체 실행 (W + PC 모두 포함)
+    session_id = executor.run(os_type="windows")
     print(f"session_id: {session_id}")

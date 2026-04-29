@@ -50,7 +50,7 @@ PREFIX_MAP: dict[str, tuple[str, str, str]] = {
     "S": ("보안 장비", "보안 장비", "other"),
     "WEB": ("웹 서비스", "웹 서비스", "other"),
     "HV": ("가상화 장비", "가상화 장비", "other"),
-    "PC": ("PC", "PC", "other"),
+    "PC": ("PC", "PC", "windows"),
     "CA": ("클라우드", "클라우드", "other"),
     "C": ("제어시스템", "제어시스템", "other"),
     "M": ("이동통신", "이동통신", "other"),
