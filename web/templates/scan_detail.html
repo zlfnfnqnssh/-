@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}{{ scan_id }} — 주통기 스캐너{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_list') }}" class="text-info">스캔 목록</a></li>
+    <li class="breadcrumb-item active text-light">{{ scan_id }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex align-items-center gap-3 mb-3 flex-wrap">
+  <h5 class="mb-0 text-white"><i class="bi bi-search text-primary me-2"></i>{{ scan_id }}</h5>
+  {% if os_name %}<span class="badge bg-secondary"><i class="bi bi-pc-display me-1"></i>{{ os_name }}</span>{% endif %}
+  {% if scan_date %}<small class="text-muted">{{ scan_date[:19] }}</small>{% endif %}
+</div>
+
+<div class="d-flex gap-2 mb-3 flex-wrap">
+  <span class="badge bg-secondary fs-6">전체 {{ counts.total }}</span>
+  <span class="badge bg-danger fs-6"><i class="bi bi-exclamation-triangle me-1"></i>취약 {{ counts.vuln }}</span>
+  <span class="badge bg-success fs-6"><i class="bi bi-check-circle me-1"></i>양호 {{ counts.ok }}</span>
+  {% if counts.improved > 0 %}
+  <span class="badge bg-info text-dark fs-6"><i class="bi bi-arrow-up-circle me-1"></i>개선 {{ counts.improved }}</span>
+  {% endif %}
+</div>
+
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item">
+    <a class="nav-link {% if tab=='all' %}active{% endif %} text-light"
+       href="{{ url_for('scan_detail', scan_id=scan_id, tab='all') }}">
+      전체 <span class="badge bg-secondary ms-1">{{ counts.total }}</span>
+    </a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link {% if tab=='vuln' %}active{% endif %} text-light"
+       href="{{ url_for('scan_detail', scan_id=scan_id, tab='vuln') }}">
+      취약 <span class="badge bg-danger ms-1">{{ counts.vuln }}</span>
+    </a>
+  </li>
+</ul>
+
+<div class="card">
+  <div class="card-body p-0">
+    {% if items %}
+    <div class="table-responsive">
+      <table class="table table-hover mb-0 align-middle">
+        <thead class="table-dark">
+          <tr>
+            <th class="text-white" style="width:80px">코드</th>
+            <th class="text-white">항목명</th>
+            <th class="text-white">카테고리</th>
+            <th class="text-center text-white" style="width:70px">위험도</th>
+            <th class="text-center text-white" style="width:80px">결과</th>
+            <th class="text-white">판정 근거</th>
+            <th style="width:100px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in items %}
+          <tr>
+            <td><code class="text-info">{{ item.item_code }}</code></td>
+            <td class="text-white fw-medium">{{ item.item_name }}</td>
+            <td class="text-light small">{{ item.get('category','') if item is mapping else '' }}</td>
+            <td class="text-center">
+              {% set sev = item.get('severity','') if item is mapping else '' %}
+              {% if sev == '상' %}<span class="badge bg-danger">상</span>
+              {% elif sev == '중' %}<span class="badge bg-warning text-dark">중</span>
+              {% else %}<span class="badge bg-secondary">하</span>{% endif %}
+            </td>
+            <td class="text-center">
+              {% if item.result == '취약' %}<span class="badge bg-danger">취약</span>
+              {% elif item.result == '개선' %}<span class="badge bg-info text-dark">개선</span>
+              {% elif item.result == '해당없음' %}<span class="badge bg-secondary">해당없음</span>
+              {% else %}<span class="badge bg-success">양호</span>{% endif %}
+            </td>
+            <td class="text-light small reason-cell">
+              {{ (item.reason or '')[:80] }}{% if item.reason and item.reason|length > 80 %}…{% endif %}
+            </td>
+            <td>
+              <div class="d-flex gap-1">
+                <a href="{{ url_for('item_detail', scan_id=scan_id, item_code=item.item_code) }}"
+                   class="btn btn-sm btn-outline-primary"><i class="bi bi-eye"></i></a>
+                {% if item.result == '취약' %}
+                <a href="{{ url_for('patch_view', scan_id=scan_id, item_code=item.item_code) }}"
+                   class="btn btn-sm btn-outline-warning"><i class="bi bi-tools"></i></a>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="text-center text-muted py-5">
+      <i class="bi bi-check-circle fs-1 d-block mb-2 text-success"></i>
+      해당하는 항목이 없습니다.
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

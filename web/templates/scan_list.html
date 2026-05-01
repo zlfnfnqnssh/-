@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}스캔 목록 — 주통기 스캐너{% endblock %}
+
+{% block content %}
+<div class="row mb-4 align-items-center">
+  <div class="col">
+    <h4 class="mb-0 text-white"><i class="bi bi-list-ul text-primary me-2"></i>스캔 이력</h4>
+    <small class="text-muted">전체 {{ scans|length }}건</small>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body p-0">
+    {% if scans %}
+    <div class="table-responsive">
+      <table class="table table-hover mb-0 align-middle">
+        <thead class="table-dark">
+          <tr>
+            <th class="text-white">#</th>
+            <th class="text-white">스캔 ID</th>
+            <th class="text-white">날짜/시간</th>
+            <th class="text-white">운영체제</th>
+            <th class="text-center text-white">전체</th>
+            <th class="text-center text-danger">취약</th>
+            <th class="text-center text-success">양호</th>
+            <th class="text-center text-white">취약률</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in scans %}
+          <tr>
+            <td class="text-muted small">{{ loop.index }}</td>
+            <td><code class="text-info small">{{ s.scan_id }}</code></td>
+            <td class="text-light small">{{ s.scan_date[:19] if s.scan_date else '—' }}</td>
+            <td class="text-light small">
+              <i class="bi bi-pc-display me-1 text-muted"></i>{{ s.os_name or 'Linux' }}
+            </td>
+            <td class="text-center text-white fw-bold">{{ s.total }}</td>
+            <td class="text-center">
+              {% if s.vuln > 0 %}<span class="badge bg-danger">{{ s.vuln }}</span>
+              {% else %}<span class="text-muted">0</span>{% endif %}
+            </td>
+            <td class="text-center"><span class="badge bg-success">{{ s.ok }}</span></td>
+            <td class="text-center">
+              {% if s.total > 0 %}
+              {% set pct = (s.vuln / s.total * 100)|int %}
+              <div class="progress mb-1" style="height:6px;min-width:80px">
+                <div class="progress-bar {% if pct > 50 %}bg-danger{% elif pct > 20 %}bg-warning{% else %}bg-success{% endif %}"
+                     style="width:{{ pct }}%"></div>
+              </div>
+              <small class="text-light">{{ pct }}%</small>
+              {% endif %}
+            </td>
+            <td>
+              <a href="{{ url_for('scan_detail', scan_id=s.scan_id) }}" class="btn btn-sm btn-primary">
+                <i class="bi bi-eye me-1"></i>상세 보기
+              </a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="text-center text-muted py-5">
+      <i class="bi bi-inbox fs-1 d-block mb-2"></i>
+      스캔 결과가 없습니다.<br>
+      <small>대시보드에서 <strong>점검하기</strong> 버튼을 눌러 시작하세요.</small>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

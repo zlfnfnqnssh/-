@@ -1,0 +1,32 @@
+# Virtual Environment
+.venv/
+
+# JSON 결과 파일들
+*.json
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Database files
+*.db
+*.bak
+db/*.db
+db/*.bak
+
+# 삭제하고 싶은 대상들 (당신이 지정한 것)
+riri_files/
+collectors/
+database/
+test_linuxparsing.py
+test_gemini.py
+find_models.py
+core/judge.py
+core/judge_and_patch.py
+core/patcher.py
+vulnerability.db
+db/guidelines.db.bak
+
+# 기타 흔한 무시 파일
+*.log
+.DS_Store
