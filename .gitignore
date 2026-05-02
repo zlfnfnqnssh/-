@@ -1,0 +1,50 @@
+# 환경변수 (비밀번호 포함)
+.env
+
+# 수집 결과 및 보고서 (개인 시스템 정보)
+data/scans/
+data/reports/
+data/*.db
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+.verdent/
+
+# 임시 파일
+*.tmp
+*.log
+scratch/
+
+# 테스트/임시 출력
+test_out.json
+scan_preview.json
+
+# 마이그레이션 아티팩트 (일회성)
+migration_mapping.json
+migrate_scripts.py
+script_mapping.json
+**/windows_backup/
+**/linux_backup/
+
+# 스캔 결과 JSON (임시)
+scripts/result_*.json
+scripts/test_results.json
+
+# 업로드된 PDF (용량 큼)
+knowledge/data/uploads/*.pdf
+
+# Node
+node_modules/
