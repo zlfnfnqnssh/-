@@ -4,33 +4,53 @@
 
 ---
 
-## 📦 통합 후 디렉토리 구조
+## 📦 통합 후 디렉토리 구조 (2026-05-03 정리)
 
 ```
 취약점진단/
-├── vulnerability-scanner/         # ★ 메인 웹 시스템 (FastAPI, riri+seojin)
-│   ├── main.py                    # 포트 8081 진입점
+├── README.md                       # 프로젝트 메인
+├── INTEGRATION_NOTES.md            # 이 파일 (통합 결과)
+├── docker-compose.yml              # PostgreSQL Docker
+├── .gitignore
+│
+├── vulnerability-scanner/          # ★ 메인 웹 시스템 (FastAPI, riri+seojin)
+│   ├── main.py                     # 포트 8081 진입점
 │   ├── scripts/
-│   │   ├── windows/               # W-01~W-64 + PC-01~PC-18 (riri 작성)
-│   │   ├── linux/                 # ✨ U-01~U-72 (syeon에서 가져옴)
-│   │   └── linux_old_riri/        # riri의 기존 Linux 스크립트 백업
-│   ├── database/                  # vs_* 테이블 (VsPatchExecution, VsLoginAttempt 포함)
-│   ├── web/                       # Tailwind UI (seojin 디자인)
+│   │   ├── windows/                # W-01~W-64 + PC-01~PC-18 (riri 작성)
+│   │   ├── linux/                  # ✨ U-01~U-72 (syeon에서 가져옴, 대문자화)
+│   │   └── linux_old_riri/         # riri의 기존 Linux 스크립트 백업
+│   ├── database/                   # vs_* 테이블 (VsPatchExecution, VsLoginAttempt)
+│   ├── web/                        # Tailwind UI (seojin 디자인)
+│   ├── engine/                     # LLM 판정·파이프라인
 │   └── ...
 │
-├── jutonggi_parser/               # ✨ 은이 PDF 파서 (별도 도구)
-│   ├── parser.py                  # pdfplumber 기반
-│   └── db.py                      # JutonggiRepository
+├── tools/                          # ✨ 별도 도구 (은이 작품)
+│   ├── jutonggi_parser/            # PDF 파서 (pdfplumber)
+│   ├── mcp_server/                 # MCP 서버 (FastMCP)
+│   ├── diagnosis/                  # 진단 실행 모듈
+│   └── ingest.py                   # PDF → DB 적재 CLI
 │
-├── mcp_server/                    # ✨ 은이 MCP 서버 (별도 도구)
-│   ├── server.py                  # FastMCP 기반
-│   └── runner.py
-│
-├── diagnosis/                     # ✨ 은이 진단 모듈 (별도 도구)
-│   ├── run_scripts.py
-│   └── scripts_db.py
-│
-└── ingest.py                      # ✨ 은이 CLI: PDF → DB 적재
+└── docs/                           # 모든 문서·자료
+    ├── presentation/               # PPT·이미지·생성 스크립트
+    │   ├── 2026-04-16_중간발표_PPT초안.md
+    │   ├── 시스템_구조도.png
+    │   ├── 기존도구_비교표.png
+    │   ├── 3대핵심_컨셉.png
+    │   ├── WBS_Gantt_취약점진단.xlsx
+    │   └── make_*.py (4개)         # 이미지/엑셀 생성 스크립트
+    ├── work-log/                   # 작업 일지
+    │   ├── 2026-04-16_작업분담_4영역.md
+    │   └── 2026-04-16_작업정리.md
+    ├── reference/                  # 주통기 참조 자료
+    │   ├── w01_w10_reference.json ~ w51_w64_reference.json
+    │   ├── pc_reference.json
+    │   ├── 주통기_Unix서버_점검항목.md
+    │   ├── 주통기_Windows서버_점검항목.md
+    │   └── 주요정보통신기반시설_*.pdf (873p)
+    └── archive/                    # 옛 자료
+        ├── notion_chunk.json
+        ├── notion_chunk_full.json
+        └── notion_page.html
 ```
 
 ---
@@ -85,8 +105,9 @@ python main.py
 # → admin / admin1234
 ```
 
-### 은이 PDF 파서 (별도)
+### 은이 PDF 파서 (별도, tools/ 폴더에서 실행)
 ```bash
+cd tools
 python ingest.py path/to/jutonggi.pdf \
   --json-out parsed_items.json \
   --db-dsn "postgresql://admin:admin123@localhost:5432/jtk_db"
@@ -94,6 +115,7 @@ python ingest.py path/to/jutonggi.pdf \
 
 ### 은이 MCP 서버 (별도)
 ```bash
+cd tools
 python -m mcp_server.server
 ```
 
