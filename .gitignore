@@ -43,6 +43,11 @@ script_mapping.json
 scripts/result_*.json
 scripts/test_results.json
 
+# 어댑터 생성물 (PostgreSQL/PDF 에서 자동 생성, 커밋 X)
+vulnerability-scanner/scripts/_2021_guidelines.json
+vulnerability-scanner/scripts/_codes_extracted.json
+tools/syeon_engine/db/
+
 # 업로드된 PDF (용량 큼)
 knowledge/data/uploads/*.pdf
 

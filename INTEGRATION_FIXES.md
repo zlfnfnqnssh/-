@@ -280,3 +280,75 @@ POST /api/scan/start (target_os=linux)
 |---|
 | `vulnerability-scanner/engine/linux_adapter.py` → `vulnerability-scanner/integration/legacy_linux_adapter.py` |
 | `vulnerability-scanner/knowledge/import_from_euni.py` → `vulnerability-scanner/integration/euni_adapter.py` (재작성, PDF 비교 기능 추가) |
+
+---
+
+# 후속 작업 (2026-05-03 오후 — 2021 PDF 통합 테스트)
+
+> 1차 통합 (`6aba2d6`) 후 실제 데이터로 E2E 테스트. 2026 PDF 는 보관, 2021 PDF로 전체 흐름을 처음부터 굴림.
+
+## 🎯 통합 테스트 목적
+
+- 4인 통합 어댑터 (`integration/`) 가 실제 PDF 적재부터 점검 결과까지 동작하는지 검증
+- 향후 새 PDF (2026) 적재 시 `item_changelog` 비교 기능이 동작하는지 사전 확인
+- 점검 스크립트가 빠진 경우 어떻게 보강하는지 워크플로 정립
+
+## 🔧 어댑터 보강 (4인 코드 0줄 변경 유지)
+
+### 1. `integration/euni_adapter.py` — 폴백 + 중복 제거 + 자동 ETL
+1. **폴백 transform** — 2021 PDF 가 2026 과 표 구조가 달라 은이 parser 가 일부 필드 (`title`, `check_content`, `check_purpose`, `security_threat`) 를 비웠음. 어댑터에서 폴백:
+   - `item_name` 빈 값 → `category` 사용
+   - `description` 빈 값 → `note` 사용
+2. **중복 제거** — 2021 PDF 는 같은 코드가 여러 페이지에 반복 등장 → `vs_guideline_items` 의 `(version_id, item_code)` UNIQUE 제약 충돌. `_dedupe_by_code()` 추가, 본문이 가장 긴 row 만 유지.
+3. **4단계 자동 ETL** — `import_pdf()` 끝에 `syeon_guideline_sync.sync()` 자동 호출. PDF 한 명령 적재로 PostgreSQL + SQLite 모두 갱신.
+
+### 2. `integration/syeon_guideline_sync.py` — 잔존 row 정리
+- INSERT OR REPLACE 만 했더니 이전 sync 의 코드가 그대로 남음 (2024-v1 의 일부 코드가 2021 sync 후에도 잔존)
+- `DELETE FROM guidelines` 추가 → SQLite 가 항상 PostgreSQL `is_current=True` 버전과 정확히 일치
+
+## 📚 2021 PDF 적재 결과
+
+| 단계 | 출력 |
+|---|---|
+| 은이 parser | 598개 raw item 파싱 |
+| `vulnerabilities` (forensic_db) | 313 unique 코드 적재 |
+| `vulnerabilities_history` | 598 row (페이지 단위) |
+| `item_changelog` | 313 added (첫 적재) |
+| `vs_guideline_items` | 170개 (linux 72 + windows 79 + PC 19), 2021 KISA = current |
+| `guidelines.db` (SQLite) | 170개 (PostgreSQL 정확 미러) |
+
+## 📂 점검 스크립트 — 2026 보관 + 2021 신규 작성
+
+| 디렉토리 | 내용 | 버전 |
+|---|---|---|
+| `scripts/windows_2026/` | W-01~W-64 64개 + 메타 파일 | 2026 (보관) |
+| `scripts/pc_2026/` | PC-01~PC-18 18개 | 2026 (보관) |
+| `scripts/linux_2026/` | U-01~U-72 72개 | 2026 (보관) |
+| `scripts/windows/` | W-01~W-82 (W-07/08/09 제외) **79개** | **2021 신규** |
+| `scripts/pc/` | PC-01~PC-19 **19개** | **2021 신규** |
+| `scripts/linux/` | U-01~U-72 **72개** | **2021 신규** |
+
+170개 신규 스크립트는 9개 agent 병렬로 작성 (각 chunk ~20개). 자동 판정 124개 / LLM 위임 ("규칙불가") 35개. 모두 `py_compile` 통과.
+
+## 🚦 알려진 제한 (테스트 결과)
+
+| 항목 | 상태 | 영향 |
+|---|---|---|
+| `scripts/pc/PC-XX.py` | scan.py 가 호출 안 함 | Windows 점검 시 W-XX 만 실행, PC 19개는 미사용 (별도 작업 필요) |
+| LLM 진행률 UI 표시 | `judge.total = 0` 으로 응답 | 백엔드 정상, 폴링 응답에서 reference 끊김 — 별도 fix |
+
+## 🛠️ 추가 변경 파일
+
+| 파일 | 변경 |
+|---|---|
+| `vulnerability-scanner/requirements.txt` | `pdfplumber`, `psycopg[binary]` 추가 |
+| `.gitignore` | 어댑터 생성물 (`_2021_guidelines.json`, `tools/syeon_engine/db/`) 무시 |
+| `start_server.bat` | **신규** — Windows 원클릭 런처 (의존성 자동 설치 + Docker 확인 + 서버 + 브라우저) |
+
+## ✅ E2E 검증
+
+- ✅ PDF 한 명령 적재 → 4단계 모두 자동 (vulnerabilities → history → changelog → vs_guideline_items → guidelines.db)
+- ✅ 웹 서버 8081 기동, 로그인 + admin/history/patch-history 페이지 OK
+- ✅ Windows 점검 시작 (UAC 승격) → 79개 스크립트 5개 병렬 실행 → vs_scan_results 적재 → LLM 판정 → vs_judgments 적재
+- ⚠ Linux 흐름 (서연 main.run_pipeline) — WSL 없어서 미검증
+- ⚠ PC 디렉토리 — scan.py 가 호출 안 해서 미검증
