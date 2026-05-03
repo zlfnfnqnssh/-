@@ -87,18 +87,26 @@ LLM 판정 분포 (Windows 79개 실측, 2026-05-03):
 
 ## 설치 및 실행 방법
 
-### 원클릭 런처 (Windows 추천)
+### 원클릭 런처
 
-```cmd
-start_server.bat
-```
+| OS | 명령 |
+|---|---|
+| Windows (cmd) | `start_server.bat` 더블클릭 또는 cmd 실행 |
+| Linux / macOS / WSL | `chmod +x start_server.sh && ./start_server.sh` |
 
-루트의 [start_server.bat](start_server.bat) 더블클릭 또는 cmd 실행. 다음을 자동 처리:
-- Python 3.10+ 확인
-- `pip install -r requirements.txt` (`.deps_installed` 마커로 한 번만)
-- Docker `postgres-db` 자동 기동 (`docker compose v2` + `docker-compose v1` fallback)
+[start_server.bat](start_server.bat) / [start_server.sh](start_server.sh) 모두 다음을 자동 처리:
+- Python 3.10+ 확인 (없으면 배포판별 설치 안내)
+- venv 생성 (`.venv/`) + `pip install -r requirements.txt` (`.deps_installed` 마커로 한 번만)
+- Docker `postgres-db` 자동 기동 (`docker compose v2` → `docker-compose v1` fallback)
 - `.env` 자동 생성 (`.env.example` → `.env`)
 - 서버 기동 + 브라우저 자동 오픈 (http://localhost:8081/login)
+- 서버 시작 실패 시 `server.log` 의 마지막 에러 라인 자동 출력 + 환경별 fix 안내
+
+`.sh` 추가 기능:
+- 배포판 감지 (Ubuntu/Debian/RHEL/Fedora/Arch/Alpine/openSUSE/macOS) → 패키지 매니저별 설치 명령 안내
+- 8081 포트 polling (최대 10초) 으로 서버 startup 대기
+- WSL 환경 자동 감지 → Docker Desktop WSL Integration 안내
+- 환경변수 `NO_BROWSER=1` 로 브라우저 자동 오픈 비활성화 가능
 
 ### 수동 설치
 

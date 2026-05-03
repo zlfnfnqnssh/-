@@ -18,6 +18,11 @@ venv/
 .venv/
 env/
 
+# 런처 생성물 (start_server.sh / start_server.bat)
+.deps_installed
+.server.pid
+server.log
+
 # IDE
 .vscode/
 .idea/
