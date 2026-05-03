@@ -23,6 +23,12 @@ env/
 .server.pid
 server.log
 
+# agent 테스트 출력
+_test_out/
+**/u*_result_*.json
+**/w*_result_*.json
+**/pc*_result_*.json
+
 # IDE
 .vscode/
 .idea/
