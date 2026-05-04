@@ -117,36 +117,147 @@ else
     say "[2/6] 의존성: ${DIM}이미 설치됨 (.deps_installed 마커)${RST}"
 fi
 
-# ── 4. Docker 확인 + postgres-db 자동 기동 ─────────────────
-say "[3/6] Docker postgres-db 확인..."
-if ! command -v docker >/dev/null 2>&1; then
-    warn "      [WARN] docker 명령을 찾을 수 없음. 점검 기능 사용 불가 (DB 없음)."
-    [ -n "$PKG_HINT" ] && say "             설치 안내: $PKG_HINT"
-elif ! docker info >/dev/null 2>&1; then
-    warn "      [WARN] Docker 데몬이 실행 중이 아님. (sudo systemctl start docker / Docker Desktop 시작)"
-else
-    if docker ps --filter "name=postgres-db" --format '{{.Names}}' 2>/dev/null | grep -q "^postgres-db$"; then
-        ok "      postgres-db 실행 중"
+# ── 4. Docker 확인 / 자동 설치 / 자동 기동 ─────────────────
+say "[3/6] Docker 환경 확인..."
+
+# 4-1. Docker 명령 자체가 없으면 자동 설치 시도
+ask_yn() {
+    # $1=prompt, returns 0 if yes
+    local prompt="$1" ans
+    if [ ! -t 0 ]; then return 1; fi   # 비대화형이면 자동 NO
+    printf "%s [y/N] " "$prompt"
+    read -r ans
+    case "$ans" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+install_docker_linux() {
+    # 배포판별 Docker 설치 (sudo 필요)
+    case "$DISTRO" in
+        ubuntu|debian|raspbian|linuxmint|pop)
+            sudo apt-get update -qq && \
+            sudo apt-get install -y docker.io docker-compose-plugin
+            ;;
+        fedora|rhel|centos|rocky|almalinux)
+            sudo dnf install -y docker docker-compose-plugin && \
+            sudo systemctl enable --now docker
+            ;;
+        arch|manjaro|endeavouros)
+            sudo pacman -S --needed --noconfirm docker docker-compose && \
+            sudo systemctl enable --now docker
+            ;;
+        alpine)
+            sudo apk add --no-cache docker docker-cli-compose && \
+            sudo rc-update add docker default && sudo service docker start
+            ;;
+        opensuse*|sles)
+            sudo zypper install -y docker docker-compose && \
+            sudo systemctl enable --now docker
+            ;;
+        *)
+            err "      [ERROR] 지원되지 않는 배포판($DISTRO). 수동 설치 필요:"
+            say "             https://docs.docker.com/engine/install/"
+            return 1
+            ;;
+    esac
+}
+
+install_docker_macos() {
+    if command -v brew >/dev/null 2>&1; then
+        say "      brew 로 Docker Desktop (cask) 설치..."
+        brew install --cask docker
     else
-        say "      postgres-db 컨테이너가 실행 중이 아님. Docker Compose 로 기동 시도..."
-        # docker compose v2 → docker-compose v1 fallback
-        if docker compose version >/dev/null 2>&1; then
-            DC_CMD="docker compose"
-        elif command -v docker-compose >/dev/null 2>&1; then
-            DC_CMD="docker-compose"
+        err "      [ERROR] Homebrew 가 없음. 수동 설치 필요:"
+        say "             https://www.docker.com/products/docker-desktop/"
+        return 1
+    fi
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+    warn "      Docker 가 설치되지 않음."
+    if ask_yn "      자동으로 설치할까요? (sudo 권한 필요)"; then
+        if [ "$DISTRO" = "macos" ]; then
+            install_docker_macos || exit 1
         else
-            DC_CMD=""
+            install_docker_linux || exit 1
         fi
-        if [ -n "$DC_CMD" ] && [ -f "$ROOT_DIR/docker-compose.yml" ]; then
-            if $DC_CMD -f "$ROOT_DIR/docker-compose.yml" up -d postgres-db; then
-                ok "      postgres-db 기동 완료 ($DC_CMD)"
-                sleep 3
-            else
-                warn "      [WARN] Docker 자동 기동 실패. DB 없이도 서버는 띄울 수 있으나 점검 기능 사용 불가."
-            fi
+        ok "      Docker 설치 완료."
+        # 설치 직후 PATH/그룹 새로고침이 필요할 수 있음
+        if [ "$DISTRO" != "macos" ] && ! groups 2>/dev/null | grep -qw docker; then
+            say "      현재 사용자를 docker 그룹에 추가 (재로그인 필요)..."
+            sudo usermod -aG docker "$USER" || true
+            warn "      [중요] docker 그룹 권한 적용을 위해 ${BOLD}로그아웃 후 다시 로그인${RST}하거나"
+            warn "             ${BOLD}newgrp docker${RST} 실행 후 이 스크립트를 재실행하세요."
+            exit 0
+        fi
+    else
+        [ -n "$PKG_HINT" ] && say "      설치 안내: $PKG_HINT"
+        say "      또는: https://docs.docker.com/engine/install/"
+        exit 1
+    fi
+fi
+
+# 4-2. Docker daemon 응답 확인 + 자동 기동
+if ! docker info >/dev/null 2>&1; then
+    warn "      Docker 데몬이 실행 중이 아님. 자동 기동 시도..."
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # macOS: Docker Desktop 실행
+        open -a Docker 2>/dev/null || open -a "Docker Desktop" 2>/dev/null || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl start docker 2>/dev/null || true
+    elif command -v service >/dev/null 2>&1; then
+        sudo service docker start 2>/dev/null || true
+    fi
+    # 데몬 준비 대기 (최대 90초)
+    say "      Docker daemon 준비 대기 (최대 90초)..."
+    DOCKER_READY=0
+    for i in $(seq 1 30); do
+        sleep 3
+        if docker info >/dev/null 2>&1; then
+            ok "      Docker daemon 준비 완료 (약 $((i*3))초)"
+            DOCKER_READY=1
+            break
+        fi
+    done
+    if [ "$DOCKER_READY" -ne 1 ]; then
+        err "      [ERROR] Docker daemon 90초 내 응답 없음."
+        if [ "$DISTRO" = "macos" ]; then
+            say "             Docker Desktop 첫 실행 시 라이선스 동의 필요할 수 있음."
         else
-            warn "      [WARN] docker compose / docker-compose 명령을 찾을 수 없음. 수동 기동 필요."
+            say "             sudo systemctl status docker 로 상태 확인."
         fi
+        exit 1
+    fi
+fi
+
+# 4-3. postgres-db 컨테이너 확인 / 기동
+if docker ps --filter "name=postgres-db" --format '{{.Names}}' 2>/dev/null | grep -q "^postgres-db$"; then
+    ok "      postgres-db 실행 중"
+else
+    say "      postgres-db 컨테이너 미실행. Docker Compose 로 기동..."
+    # docker compose v2 → docker-compose v1 fallback
+    if docker compose version >/dev/null 2>&1; then
+        DC_CMD="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        DC_CMD="docker-compose"
+    else
+        DC_CMD=""
+    fi
+    if [ -n "$DC_CMD" ] && [ -f "$ROOT_DIR/docker-compose.yml" ]; then
+        if $DC_CMD -f "$ROOT_DIR/docker-compose.yml" up -d postgres-db; then
+            ok "      postgres-db 기동 완료 ($DC_CMD)"
+            # postgres ready 폴링 (최대 30초)
+            for i in $(seq 1 15); do
+                sleep 2
+                if docker exec postgres-db pg_isready -U postgres >/dev/null 2>&1; then
+                    ok "      postgres ready (약 $((i*2))초)"
+                    break
+                fi
+            done
+        else
+            warn "      [WARN] Docker 자동 기동 실패. DB 없이도 서버는 띄울 수 있으나 점검 기능 사용 불가."
+        fi
+    else
+        warn "      [WARN] docker compose / docker-compose 명령을 찾을 수 없음. 수동 기동 필요."
     fi
 fi
 
