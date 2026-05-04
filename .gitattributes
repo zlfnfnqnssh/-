@@ -1,0 +1,22 @@
+# 자동 줄바꿈 처리
+* text=auto
+
+# 셸 스크립트는 항상 LF (Windows 에서 편집해도 LF 유지) — Linux/macOS 에서 shebang 깨짐 방지
+*.sh        text eol=lf
+
+# Windows 배치 파일은 항상 CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Python 은 LF (PEP 8 권장)
+*.py        text eol=lf
+
+# 바이너리 (자동 변환 금지)
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.xlsx      binary
+*.zip       binary
+*.ico       binary
