@@ -83,71 +83,74 @@ if errorlevel 1 (
 
 REM 3-2. Docker daemon 응답 확인 (Desktop 미실행 시 재시도)
 docker version >nul 2>nul
-if errorlevel 1 (
-    echo       Docker Desktop 이 실행 중이 아님. 자동 기동 시도...
-    REM Program Files 경로 우선 시도, 실패 시 Local AppData
-    if exist "%ProgramFiles%\Docker\Docker\Docker Desktop.exe" (
-        start "" "%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
-    ) else if exist "%LOCALAPPDATA%\Programs\Docker\Docker\Docker Desktop.exe" (
-        start "" "%LOCALAPPDATA%\Programs\Docker\Docker\Docker Desktop.exe"
-    ) else (
-        echo [WARN] Docker Desktop.exe 위치를 못 찾음. 수동으로 Docker Desktop 실행 후 재시도.
-        pause & exit /b 1
-    )
-    echo       Docker daemon 준비 대기 (최대 90초)...
-    set "_DOCKER_READY="
-    for /L %%i in (1,1,30) do (
+if not errorlevel 1 goto :docker_ok
+
+echo       Docker Desktop 이 실행 중이 아님. 자동 기동 시도...
+REM Program Files 경로 우선 시도, 실패 시 Local AppData
+if exist "%ProgramFiles%\Docker\Docker\Docker Desktop.exe" (
+    start "" "%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
+) else if exist "%LOCALAPPDATA%\Programs\Docker\Docker\Docker Desktop.exe" (
+    start "" "%LOCALAPPDATA%\Programs\Docker\Docker\Docker Desktop.exe"
+) else (
+    echo [WARN] Docker Desktop.exe 위치를 못 찾음. 수동으로 Docker Desktop 실행 후 재시도.
+    pause & exit /b 1
+)
+echo       Docker daemon 준비 대기 ^(최대 90초^)...
+set "_DOCKER_READY="
+for /L %%i in (1,1,30) do (
+    if not defined _DOCKER_READY (
         timeout /t 3 /nobreak >nul
         docker version >nul 2>nul
-        if not errorlevel 1 (
-            echo       Docker daemon 준비 완료 ^(약 %%i*3 초^)
-            set "_DOCKER_READY=1"
-            goto :_docker_ready
-        )
-    )
-    :_docker_ready
-    if not defined _DOCKER_READY (
-        echo [ERROR] Docker daemon 90초 내 응답 없음. Docker Desktop 수동 확인 필요.
-        echo         첫 실행이라면 라이선스 동의 창이 뜨지 않았는지 확인.
-        pause & exit /b 1
+        if not errorlevel 1 set "_DOCKER_READY=1"
     )
 )
+if not defined _DOCKER_READY (
+    echo [ERROR] Docker daemon 90초 내 응답 없음. Docker Desktop 수동 확인 필요.
+    echo         첫 실행이라면 라이선스 동의 창이 뜨지 않았는지 확인.
+    pause & exit /b 1
+)
+echo       Docker daemon 준비 완료
+:docker_ok
 
 REM 3-3. postgres-db 컨테이너 확인 / 기동
 docker ps --filter "name=postgres-db" --format "{{.Names}}" 2>nul | findstr /i postgres-db >nul
-if errorlevel 1 (
-    echo       postgres-db 컨테이너 미실행. Docker Compose 로 기동...
-    docker compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
-    if errorlevel 1 (
-        docker-compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
-        if errorlevel 1 (
-            echo [WARN] postgres-db 자동 기동 실패. docker-compose.yml 확인 필요.
-            pause
-        ) else (
-            echo       postgres-db 기동 완료 ^(docker-compose v1^)
-        )
-    ) else (
-        echo       postgres-db 기동 완료 ^(docker compose v2^)
-    )
-    REM postgres ready 폴링 (최대 30초) — 첫 컨테이너 생성 후 connection 준비 시간
-    echo       postgres ready 대기 (최대 30초)...
-    set "_PG_READY="
-    for /L %%i in (1,1,15) do (
+if not errorlevel 1 (
+    echo       postgres-db 실행 중
+    goto :pg_done
+)
+
+echo       postgres-db 컨테이너 미실행. Docker Compose 로 기동...
+docker compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
+if not errorlevel 1 (
+    echo       postgres-db 기동 완료 ^(docker compose v2^)
+    goto :pg_started
+)
+docker-compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
+if not errorlevel 1 (
+    echo       postgres-db 기동 완료 ^(docker-compose v1^)
+    goto :pg_started
+)
+echo [WARN] postgres-db 자동 기동 실패. docker-compose.yml 확인 필요.
+pause
+goto :pg_done
+
+:pg_started
+REM postgres ready 폴링 (최대 30초)
+echo       postgres ready 대기 ^(최대 30초^)...
+set "_PG_READY="
+for /L %%i in (1,1,15) do (
+    if not defined _PG_READY (
         timeout /t 2 /nobreak >nul
         docker exec postgres-db pg_isready -U postgres >nul 2>nul
-        if not errorlevel 1 (
-            echo       postgres ready ^(약 %%i x2 초^)
-            set "_PG_READY=1"
-            goto :_pg_ready
-        )
+        if not errorlevel 1 set "_PG_READY=1"
     )
-    :_pg_ready
-    if not defined _PG_READY (
-        echo [WARN] postgres 30초 내 ready 안 됨. 서버 시작이 실패하면 잠시 후 재실행.
-    )
-) else (
-    echo       postgres-db 실행 중
 )
+if not defined _PG_READY (
+    echo [WARN] postgres 30초 내 ready 안 됨. 서버 시작이 실패하면 잠시 후 재실행.
+) else (
+    echo       postgres ready
+)
+:pg_done
 
 REM ── 4. .env 파일 확인 ────────────────────────────────────
 if not exist ".env" (
