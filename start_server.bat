@@ -92,7 +92,8 @@ if not exist ".env" (
 REM ── 5. 서버 기동 + 브라우저 ─────────────────────────────────
 echo [4/5] 서버 기동 (포트 8081)...
 REM 자식 cmd 에도 UTF-8 + Python UTF-8 모드 전파 (서버 로그 한글 안 깨지게)
-start "주통기 진단 서버" /MIN cmd /k "chcp 65001 >nul & set PYTHONIOENCODING=utf-8 & set PYTHONUTF8=1 & python main.py"
+REM set "VAR=value" 형식 필수 — 공백 없이! (Python의 PYTHONUTF8은 "1" 정확히 일치 요구)
+start "주통기 진단 서버" /MIN cmd /k "chcp 65001>nul&&set "PYTHONIOENCODING=utf-8"&&set "PYTHONUTF8=1"&&python main.py"
 
 echo [5/5] 서버 시작 대기 (5초)...
 timeout /t 5 /nobreak >nul
