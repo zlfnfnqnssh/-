@@ -76,7 +76,7 @@ if errorlevel 1 (
     echo ============================================================
     echo  Docker Desktop 설치 완료!
     echo  ※ 시스템 PATH 반영을 위해 이 창을 닫고 start_server.bat 을
-    echo     다시 실행해주세요. (첫 실행 시 라이선스 동의 창이 뜰 수 있음)
+    echo     다시 실행해주세요. ^(첫 실행 시 라이선스 동의 창이 뜰 수 있음^)
     echo ============================================================
     pause & exit /b 0
 )
@@ -113,19 +113,31 @@ echo       Docker daemon 준비 완료
 :docker_ok
 
 REM 3-3. postgres-db 컨테이너 확인 / 기동
+REM 주의: docker-compose.yml 의 서비스명은 "postgres" (컨테이너명만 "postgres-db")
 docker ps --filter "name=postgres-db" --format "{{.Names}}" 2>nul | findstr /i postgres-db >nul
 if not errorlevel 1 (
     echo       postgres-db 실행 중
     goto :pg_done
 )
 
-echo       postgres-db 컨테이너 미실행. Docker Compose 로 기동...
-docker compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
+REM 컨테이너가 stopped 상태로 존재? → docker start 로 빠르게 기동
+docker ps -a --filter "name=postgres-db" --format "{{.Names}}" 2>nul | findstr /i postgres-db >nul
+if not errorlevel 1 (
+    echo       postgres-db 컨테이너 stopped → 재시작...
+    docker start postgres-db >nul 2>nul
+    if not errorlevel 1 (
+        echo       postgres-db 재시작 완료
+        goto :pg_started
+    )
+)
+
+echo       postgres-db 컨테이너 없음. Docker Compose 로 신규 생성...
+docker compose -f "%~dp0docker-compose.yml" up -d postgres 2>nul
 if not errorlevel 1 (
     echo       postgres-db 기동 완료 ^(docker compose v2^)
     goto :pg_started
 )
-docker-compose -f "%~dp0docker-compose.yml" up -d postgres-db 2>nul
+docker-compose -f "%~dp0docker-compose.yml" up -d postgres 2>nul
 if not errorlevel 1 (
     echo       postgres-db 기동 완료 ^(docker-compose v1^)
     goto :pg_started
@@ -169,8 +181,9 @@ if not exist ".env" (
 REM ── 5. 서버 기동 + 브라우저 ─────────────────────────────────
 echo [4/5] 서버 기동 (포트 8081)...
 REM 자식 cmd 에도 UTF-8 + Python UTF-8 모드 전파 (서버 로그 한글 안 깨지게)
-REM set "VAR=value" 형식 필수 — 공백 없이! (Python의 PYTHONUTF8은 "1" 정확히 일치 요구)
-start "주통기 진단 서버" /MIN cmd /k "chcp 65001>nul&&set "PYTHONIOENCODING=utf-8"&&set "PYTHONUTF8=1"&&python main.py"
+REM 주의: cmd /k "..." 안에서 추가 따옴표 쓰면 외부 따옴표가 조기 종료됨 → 따옴표 없이!
+REM 주의: set 뒤에 공백+& 두면 환경변수 값에 공백 포함됨 → && 앞뒤 공백 없음 필수
+start "주통기 진단 서버" /MIN cmd /k "chcp 65001>nul&&set PYTHONIOENCODING=utf-8&&set PYTHONUTF8=1&&python main.py"
 
 echo [5/5] 서버 시작 대기 (5초)...
 timeout /t 5 /nobreak >nul

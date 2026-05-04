@@ -230,11 +230,21 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # 4-3. postgres-db 컨테이너 확인 / 기동
+# 주의: docker-compose.yml 서비스명은 "postgres" (컨테이너명만 "postgres-db")
+PG_STARTED=0
 if docker ps --filter "name=postgres-db" --format '{{.Names}}' 2>/dev/null | grep -q "^postgres-db$"; then
     ok "      postgres-db 실행 중"
-else
-    say "      postgres-db 컨테이너 미실행. Docker Compose 로 기동..."
-    # docker compose v2 → docker-compose v1 fallback
+    PG_STARTED=1
+elif docker ps -a --filter "name=postgres-db" --format '{{.Names}}' 2>/dev/null | grep -q "^postgres-db$"; then
+    say "      postgres-db 컨테이너 stopped → 재시작..."
+    if docker start postgres-db >/dev/null 2>&1; then
+        ok "      postgres-db 재시작 완료"
+        PG_STARTED=1
+    fi
+fi
+
+if [ "$PG_STARTED" -ne 1 ]; then
+    say "      postgres-db 컨테이너 없음. Docker Compose 로 신규 생성..."
     if docker compose version >/dev/null 2>&1; then
         DC_CMD="docker compose"
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -243,22 +253,26 @@ else
         DC_CMD=""
     fi
     if [ -n "$DC_CMD" ] && [ -f "$ROOT_DIR/docker-compose.yml" ]; then
-        if $DC_CMD -f "$ROOT_DIR/docker-compose.yml" up -d postgres-db; then
+        if $DC_CMD -f "$ROOT_DIR/docker-compose.yml" up -d postgres; then
             ok "      postgres-db 기동 완료 ($DC_CMD)"
-            # postgres ready 폴링 (최대 30초)
-            for i in $(seq 1 15); do
-                sleep 2
-                if docker exec postgres-db pg_isready -U postgres >/dev/null 2>&1; then
-                    ok "      postgres ready (약 $((i*2))초)"
-                    break
-                fi
-            done
+            PG_STARTED=1
         else
-            warn "      [WARN] Docker 자동 기동 실패. DB 없이도 서버는 띄울 수 있으나 점검 기능 사용 불가."
+            warn "      [WARN] postgres 자동 기동 실패. DB 없이도 서버는 띄울 수 있으나 점검 기능 사용 불가."
         fi
     else
         warn "      [WARN] docker compose / docker-compose 명령을 찾을 수 없음. 수동 기동 필요."
     fi
+fi
+
+# postgres ready 폴링 (최대 30초)
+if [ "$PG_STARTED" -eq 1 ]; then
+    for i in $(seq 1 15); do
+        sleep 2
+        if docker exec postgres-db pg_isready -U postgres >/dev/null 2>&1; then
+            ok "      postgres ready (약 $((i*2))초)"
+            break
+        fi
+    done
 fi
 
 # ── 5. .env 자동 생성 ──────────────────────────────────────
