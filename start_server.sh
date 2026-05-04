@@ -134,8 +134,38 @@ install_docker_linux() {
     # 배포판별 Docker 설치 (sudo 필요)
     case "$DISTRO" in
         ubuntu|debian|raspbian|linuxmint|pop)
-            sudo apt-get update -qq && \
-            sudo apt-get install -y docker.io docker-compose-plugin
+            # Docker 공식 저장소 추가 → docker-ce + docker-compose-plugin 설치
+            # (Ubuntu 기본 저장소의 docker.io 는 docker-compose-plugin 미포함)
+            local repo_distro="ubuntu"
+            local gpg_url="https://download.docker.com/linux/ubuntu/gpg"
+            case "$DISTRO" in
+                debian|raspbian)
+                    repo_distro="debian"
+                    gpg_url="https://download.docker.com/linux/debian/gpg"
+                    ;;
+                linuxmint|pop)
+                    # Mint/Pop 은 Ubuntu 베이스 → ubuntu 저장소 사용 + UBUNTU_CODENAME 참조
+                    ;;
+            esac
+
+            sudo apt-get update -qq || return 1
+            sudo apt-get install -y ca-certificates curl gnupg lsb-release || return 1
+
+            sudo install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL "$gpg_url" | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg || return 1
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+            # codename: Ubuntu 파생은 UBUNTU_CODENAME 우선, 없으면 VERSION_CODENAME
+            local codename
+            codename="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
+            local arch
+            arch="$(dpkg --print-architecture)"
+            echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$repo_distro $codename stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+            sudo apt-get update -qq || return 1
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin || return 1
             ;;
         fedora|rhel|centos|rocky|almalinux)
             sudo dnf install -y docker docker-compose-plugin && \
