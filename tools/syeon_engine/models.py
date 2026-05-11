@@ -41,46 +41,6 @@ class ScanResult:
 
     @classmethod
     def from_dict(cls, d: dict, max_raw_lines: int = 5) -> "ScanResult":
-        # 스크립트 flat 포맷 처리 (item_code 있고 items 없는 단일 항목 출력)
-        if "item_code" in d and "items" not in d:
-            valid_fields = set(SubCheckResult.__dataclass_fields__.keys())
-            sub_checks = d.get("sub_checks", [])
-            if not sub_checks:
-                # sub_checks 없는 단순 flat 포맷 (U-19 이후 서비스 관리 항목 등)
-                # → 최상위 collected_value/raw_output/source_command 로 단일 SubCheckResult 생성
-                cv_lower = d.get("collected_value", "").lower()
-                if any(kw in cv_lower for kw in ["미설치", "not_installed", "not installed"]):
-                    svc_status = "NOT_INSTALLED"
-                elif any(kw in cv_lower for kw in ["비활성", "not_running", "not running", "inactive", "비활성화"]):
-                    svc_status = "NOT_RUNNING"
-                elif any(kw in cv_lower for kw in ["활성", "running", "active", "실행 중"]):
-                    svc_status = "RUNNING"
-                else:
-                    svc_status = "N/A"
-                sub_checks = [{
-                    "sub_check":       d.get("item_name", "점검"),
-                    "config_file":     "",
-                    "collected_value": d.get("collected_value", ""),
-                    "raw_output":      d.get("raw_output", ""),
-                    "service_status":  svc_status,
-                    "source_command":  d.get("source_command", ""),
-                }]
-            d = {
-                "scan_id":    d.get("scan_id", ""),
-                "scan_date":  d.get("scan_date", ""),
-                "target_os":  d.get("target_os", ""),
-                "os_name":    d.get("os_name", ""),
-                "items": [{
-                    "category":      d.get("category", ""),
-                    "item_code":     d["item_code"],
-                    "item_name":     d.get("item_name", ""),
-                    "check_results": [
-                        dict({k: v for k, v in sc.items() if k in valid_fields},
-                             service_status=sc.get("service_status", "N/A"))
-                        for sc in sub_checks
-                    ],
-                }],
-            }
         items = []
         for it in d.get("items", []):
             sub_results = []
