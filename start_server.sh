@@ -300,6 +300,20 @@ fi
 if [ -n "${LISTEN_PID:-}" ]; then
     warn "[5/6] 8081 포트가 이미 사용 중 (PID=$LISTEN_PID). 기존 서버 그대로 사용."
 else
+    # 이전 실행에서 남은 고아 프로세스 정리
+    if [ -f "$PID_FILE" ]; then
+        OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            say "      이전 서버 프로세스 종료 (PID=$OLD_PID)..."
+            kill "$OLD_PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$OLD_PID" 2>/dev/null || true
+        fi
+    fi
+    # python main.py 이름으로 남은 프로세스도 정리
+    pkill -f "python main\.py" 2>/dev/null || true
+    sleep 1
+
     say "[5/6] 서버 기동 (포트 8081, 로그: $LOG_FILE)..."
     export PYTHONIOENCODING=utf-8
     export PYTHONUTF8=1

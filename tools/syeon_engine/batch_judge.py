@@ -1,26 +1,23 @@
 """
-batch_judge.py  (v6)
+batch_judge.py  (v7)
 --------------------
 규칙/LLM 하이브리드 판정 엔진.
 
+변경사항 (v7):
+  1. raw_output 2차 호출 비활성화 (include_raw 항상 False)
+  2. 프롬프트 길이 대폭 축소 + 총 글자수 상한 제어 (MAX_PROMPT_CHARS)
+  3. asyncio.Semaphore 기반 동시 호출 제어 (MAX_CONCURRENT)
+  4. BATCH_SIZE 기본값 3으로 축소
+
 흐름:
   1단계 규칙 엔진 → 분류
-    ├─ 규칙 확정 취약 (점수 ≥ RULE_CERTAIN_VULN)  → 즉시 확정
-    ├─ 규칙 확정 양호 (conclusive, 점수 < 70)       → 배치 LLM 검증
-    └─ 불확실 / 취약 가능성                         → 개별 LLM (가이드라인 전문)
+    ├─ 전체 미설치              → 즉시 해당없음 (LLM 없음)
+    ├─ 규칙 확정 취약 (≥85)    → 즉시 취약 (LLM 없음)
+    ├─ 규칙 확정 양호 (conclusive, <70) → 배치 LLM
+    └─ 불확실                   → 개별 LLM
 
-서비스 상태값 (표준):
-  RUNNING        → 서비스 실행 중
-  NOT_RUNNING    → 설치됨, 중지 상태
-  NOT_INSTALLED  → 미설치
-  INSTALLED      → 설치됨(파일/설정 존재), 데몬 가동 불명
-  N/A            → 서비스 무관 (파일 권한/설정값 체크)
-
-규칙 엔진 설계 원칙:
-  - 항목 코드(U-XX) 하드코딩 없음
-  - 파일명 하드코딩 없음 → DB vuln_keywords/ok_keywords 의존
-  - 구조적 패턴(ls -la, count, shadow:x:) 은 유닉스 범용이므로 유지
-  - service_status 를 sub_check별 1차 신호로 사용
+서비스 상태값:
+  RUNNING / NOT_RUNNING / NOT_INSTALLED / INSTALLED / N/A
 """
 
 import asyncio
@@ -28,33 +25,97 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import asdict
+import time as _time
 from typing import Optional
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from schemas import JudgePayload, JudgeResult
+
+load_dotenv()
 
 # ──────────────────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────────────────
 
-GEMINI_MODEL         = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_REQUEST_DELAY = float(os.getenv("GEMINI_REQUEST_DELAY", "6"))
-GEMINI_RETRY_DELAY   = float(os.getenv("GEMINI_RETRY_DELAY", "70"))
-GEMINI_MAX_RETRY     = int(os.getenv("GEMINI_MAX_RETRY", "5"))
-BATCH_SIZE           = int(os.getenv("BATCH_SIZE", "10"))
-RULE_CERTAIN_VULN    = int(os.getenv("RULE_CERTAIN_VULN", "85"))
-GUIDELINE_DB_PATH    = os.getenv("GUIDELINE_DB_PATH", "./db/guidelines.db")
+GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
 
-SCORE_WEIGHT_RULE = 0.6
-SCORE_WEIGHT_LLM  = 0.4
-THRESHOLD_VULN    = 70
-THRESHOLD_OK      = 40
+
+def _gemini_model() -> str:
+    """매 호출 시 .env 변경이 반영되도록 런타임에 읽음."""
+    return os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT)
+
+GEMINI_RETRY_DELAY = float(os.getenv("GEMINI_RETRY_DELAY", "65"))
+GEMINI_MAX_RETRY   = int(os.getenv("GEMINI_MAX_RETRY",   "4"))
+BATCH_SIZE         = int(os.getenv("BATCH_SIZE",         "3"))   # 확정양호 배치 크기 (할루시네이션 방지)
+RULE_CERTAIN_VULN  = int(os.getenv("RULE_CERTAIN_VULN",  "85"))
+GUIDELINE_DB_PATH  = os.getenv("GUIDELINE_DB_PATH",   "./db/guidelines.db")
+
+# 동시 호출 제한 — 개별 항목은 순차(1)로, 버스트 방지
+MAX_CONCURRENT     = int(os.getenv("MAX_CONCURRENT",  "1"))
+
+# 프롬프트 총 글자수 상한 (초과 시 truncate) — Gemini 2.5 Flash 1M 토큰 고려하여 넉넉히
+MAX_PROMPT_CHARS   = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
+
+# RPM / TPM 상한 (Rate Limiter)
+MAX_RPM            = int(os.getenv("MAX_RPM",   "9"))
+MAX_TPM            = int(os.getenv("MAX_TPM",   "200000"))
+REQUEST_MIN_DELAY  = float(os.getenv("REQUEST_MIN_DELAY", "7.0"))  # 10 RPM 안전마진
+PROMPT_DUMP_FILE   = os.getenv("PROMPT_DUMP_FILE", "/tmp/syeon_prompts_latest.txt")
+
+SCORE_WEIGHT_RULE  = 0.30
+SCORE_WEIGHT_LLM   = 0.70
+THRESHOLD_VULN     = 70
+THRESHOLD_OK       = 40
 
 
 def _get_api_key() -> str:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or ""
+    return os.getenv("GEMINI_API_KEY") or ""
+
+
+# ──────────────────────────────────────────────────────────
+# Rate Limiter (모듈 레벨)
+# ──────────────────────────────────────────────────────────
+
+_rl_window:    list  = []
+_rl_tpm_used:  int   = 0
+_rl_tpm_reset: float = 0.0
+
+
+async def _rate_limit_wait(estimated_tokens: int = 2000):
+    """RPM / TPM 한도 초과 예상 시 다음 분까지 대기."""
+    global _rl_window, _rl_tpm_used, _rl_tpm_reset
+
+    now = _time.time()
+    _rl_window = [t for t in _rl_window if now - t < 60]
+
+    if now - _rl_tpm_reset >= 60:
+        _rl_tpm_used  = 0
+        _rl_tpm_reset = now
+
+    # RPM 체크
+    if len(_rl_window) >= MAX_RPM:
+        wait = 61 - (now - _rl_window[0])
+        if wait > 0:
+            print(f"    [RateLimit] RPM {len(_rl_window)}/{MAX_RPM} → {wait:.0f}초 대기")
+            await asyncio.sleep(wait)
+            now = _time.time()
+            _rl_window = [t for t in _rl_window if now - t < 60]
+
+    # TPM 체크
+    if _rl_tpm_used + estimated_tokens > MAX_TPM:
+        wait = 61 - (now - _rl_tpm_reset)
+        if wait > 0:
+            print(f"    [RateLimit] TPM {_rl_tpm_used}/{MAX_TPM} → {wait:.0f}초 대기")
+            await asyncio.sleep(wait)
+            _rl_tpm_used  = 0
+            _rl_tpm_reset = _time.time()
+
+    if REQUEST_MIN_DELAY > 0:
+        await asyncio.sleep(REQUEST_MIN_DELAY)
+    _rl_window.append(_time.time())
+    _rl_tpm_used += estimated_tokens
 
 
 # ──────────────────────────────────────────────────────────
@@ -68,10 +129,13 @@ class _DB:
     def get(cls, code: str) -> dict:
         if code in cls._cache:
             return cls._cache[code]
+        db_path = os.getenv("GUIDELINE_DB_PATH", GUIDELINE_DB_PATH)
         try:
-            conn = sqlite3.connect(GUIDELINE_DB_PATH)
+            conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM guidelines WHERE item_code=?", (code,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM guidelines WHERE item_code=?", (code,)
+            ).fetchone()
             conn.close()
             cls._cache[code] = dict(row) if row else {}
         except Exception:
@@ -80,18 +144,20 @@ class _DB:
 
     @classmethod
     def vuln_kw(cls, code: str) -> list[str]:
-        return [k.strip().lower() for k in cls.get(code).get("vuln_keywords", "").split(",") if k.strip()]
+        return [k.strip().lower()
+                for k in cls.get(code).get("vuln_keywords", "").split(",") if k.strip()]
 
     @classmethod
     def ok_kw(cls, code: str) -> list[str]:
-        return [k.strip().lower() for k in cls.get(code).get("ok_keywords", "").split(",") if k.strip()]
+        return [k.strip().lower()
+                for k in cls.get(code).get("ok_keywords", "").split(",") if k.strip()]
 
     @classmethod
     def standard(cls, code: str) -> str:
         g = cls.get(code)
         parts = []
-        if g.get("standard"): parts.append(g["standard"])
-        if g.get("severity"): parts.append(f"위험도: {g['severity']}")
+        if g.get("standard"):  parts.append(g["standard"])
+        if g.get("severity"):  parts.append(f"위험도:{g['severity']}")
         return " | ".join(parts) if parts else "가이드라인 없음"
 
     @classmethod
@@ -112,11 +178,10 @@ class _DB:
 
 
 # ──────────────────────────────────────────────────────────
-# 구조적 패턴 헬퍼 (유닉스 범용 — 항목 무관)
+# 구조적 패턴 헬퍼
 # ──────────────────────────────────────────────────────────
 
 def _parse_permission(cv: str) -> dict:
-    """ls -la 첫 줄에서 rwx 권한 파싱."""
     m = re.search(r'^[-dlcbps]([rwxsStT-]{3})([rwxsStT-]{3})([rwxsStT-]{3})', cv.strip())
     if not m:
         return {}
@@ -130,7 +195,6 @@ def _parse_permission(cv: str) -> dict:
 
 
 def _count_found(cv: str) -> int:
-    """'N개 발견', 'N found', 'Hidden N:' 등에서 숫자 반환. 없으면 -1."""
     for pat in [r'(\d+)\s*개\s*발견', r'(\d+)\s*found', r'Hidden\s+\w+:\s*(\d+)']:
         m = re.search(pat, cv, re.IGNORECASE)
         if m:
@@ -150,41 +214,24 @@ _SAFE_CONFIG_WORDS = [
 
 
 # ──────────────────────────────────────────────────────────
-# 규칙 엔진 (v3 — 비하드코딩, 서비스상태 우선)
+# 규칙 엔진
 # ──────────────────────────────────────────────────────────
 
 def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
     """
-    (score 0~100, reason, is_conclusive)
-
-    서비스 상태 우선 원칙:
-      NOT_INSTALLED  → -25 / sub_check 스킵  (서비스 없음)
-      NOT_RUNNING    → -15  (설치됨, 중지)
-      INSTALLED      → +5   (파일 존재, 가동 불명)
-      RUNNING        → +10  (실행 중, 설정 확인 필수)
-      N/A            → 0    (순수 파일/설정 체크)
-
-    설정값 분석 원칙:
-      파일/설정 없음 → 서비스 없을 때 무시, 아닐 때 +15
-      ls -la 권한   → world_write(+50) group_write(+30) world_read(+20) 양호(-10)
-      N개 발견 패턴 → 0개(-20) 1~5개(+20) 6+개(+35)
-      shadow:x: 패턴 → -20 (shadow 사용 중 = 양호)
-      DB vuln_keywords → +40 / ok_keywords → -30
-
-    conclusive 규칙:
-      전체 NOT_INSTALLED         → score=0, conclusive=True
-      서비스체크 전체 absent     → score=0, conclusive=True
+    반환: (score 0~100, reason, is_conclusive)
+    score == -1 → 전체 미설치 (해당없음 마커)
     """
     checks = payload.check_results
     code   = payload.item_code
     vkws   = _DB.vuln_kw(code)
     okws   = _DB.ok_kw(code)
 
-    # ── 전역 확정: 전체 미설치 ──────────────────────────────
+    # ── 전역 확정: 전체 미설치 ─────────────────────────────
     if checks and all(c.service_status.upper() == "NOT_INSTALLED" for c in checks):
-        return 0, "전체 서비스/패키지 미설치", True
+        return -1, "전체 서비스/패키지 미설치", True
 
-    # ── 전역 확정: 서비스 체크(비N/A)가 모두 absent ─────────
+    # ── 전역 확정: 서비스 체크 전체 비활성+파일없음 ────────
     svc_checks = [c for c in checks if c.service_status.upper() != "N/A"]
     if svc_checks:
         all_absent = all(
@@ -201,57 +248,46 @@ def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
         cv   = c.collected_value or ""
         comb = cv.lower()
         svc  = c.service_status.upper()
-        sub  = c.sub_check[:20]
+        sub  = c.sub_check[:18]
 
-        # ─ Step 1: 서비스 상태 신호 ──────────────────────────
+        # Step 1: 서비스 상태
         if svc == "NOT_INSTALLED":
-            total -= 25
-            reasons.append(f"{sub}:미설치(-25)")
-            continue   # 설치 안 됨 → 이 항목 설정 확인 불필요
-
+            total -= 25; reasons.append(f"{sub}:미설치(-25)"); continue
         if svc == "NOT_RUNNING":
-            total -= 15
-            reasons.append(f"{sub}:미실행(-15)")
-            # 파일 권한 등은 계속 확인 (설치됨이므로)
-
+            total -= 25; reasons.append(f"{sub}:미실행(-25)")
         elif svc == "RUNNING":
-            total += 10
-            reasons.append(f"{sub}:실행중(+10)")
-
+            total += 10; reasons.append(f"{sub}:실행중(+10)")
         elif svc == "INSTALLED":
-            total += 5
-            reasons.append(f"{sub}:설치됨(+5)")
+            total += 5;  reasons.append(f"{sub}:설치됨(+5)")
 
-        # N/A → 0 (서비스 신호 없음, 파일/설정 확인으로)
-
-        # ─ Step 2: 파일/설정 없음 처리 ─────────────────────────
+        # Step 2: 파일/설정 없음
         if any(pat in comb for pat in _ABSENT_PATTERNS + ["권한 없음"]):
             if svc in ("NOT_RUNNING", "NOT_INSTALLED"):
                 reasons.append(f"{sub}:서비스없음→파일없음(무시)")
-            elif "권한 없음" in comb:
-                total += 15
-                reasons.append(f"{sub}:읽기권한없음(+15)")
             else:
-                total += 15
-                reasons.append(f"{sub}:파일/설정없음(+15)")
+                total += 15; reasons.append(f"{sub}:파일/설정없음(+15)")
             continue
 
-        # ─ Step 3: ls -la 권한 파싱 (유닉스 범용) ──────────────
+        # Step 3: nouser/nogroup
+        if re.search(r'\bnouser\b|\bnogroup\b', comb):
+            total += 10; reasons.append(f"{sub}:nouser/nogroup(+10)")
+
+        # Step 4: ls -la 권한
         perm = _parse_permission(cv)
         if perm:
             if perm.get("world_write"):
-                total += 50; reasons.append(f"{sub}:world_write(+50)")
+                total += 20; reasons.append(f"{sub}:world_write(+20)")
             elif perm.get("group_write"):
-                total += 30; reasons.append(f"{sub}:group_write(+30)")
+                total += 10; reasons.append(f"{sub}:group_write(+10)")
             elif perm.get("world_read"):
-                total += 20; reasons.append(f"{sub}:world_read(+20)")
+                total += 10; reasons.append(f"{sub}:world_read(+10)")
             else:
                 total -= 10; reasons.append(f"{sub}:권한양호(-10)")
             if not re.search(r'\broot\b', cv):
-                total += 20; reasons.append(f"{sub}:비root소유(+20)")
+                total += 15; reasons.append(f"{sub}:비root소유(+15)")
             continue
 
-        # ─ Step 4: "N개 발견" 패턴 (유닉스 범용) ──────────────
+        # Step 5: N개 발견
         found_n = _count_found(cv)
         if found_n >= 0:
             if found_n == 0:
@@ -262,26 +298,24 @@ def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
                 total += 35; reasons.append(f"{sub}:{found_n}개발견(+35)")
             continue
 
-        # ─ Step 5: shadow 패스워드 패턴 (유닉스 범용) ───────────
+        # Step 6: shadow 패스워드
         if re.search(r'[a-z_][a-z0-9_-]*:x:\d+:\d+:', comb):
-            total -= 20; reasons.append(f"{sub}:shadow패스워드(-20)")
-            continue
+            total -= 20; reasons.append(f"{sub}:shadow패스워드(-20)"); continue
 
-        # ─ Step 6: RUNNING인데 안전 설정 없음 ─────────────────
-        if svc == "RUNNING":
-            if not any(k in comb for k in _SAFE_CONFIG_WORDS):
-                total += 20; reasons.append(f"{sub}:실행+제한없음(+20)")
+        # Step 7: RUNNING + 안전설정 없음
+        if svc == "RUNNING" and not any(k in comb for k in _SAFE_CONFIG_WORDS):
+            total += 20; reasons.append(f"{sub}:실행+제한없음(+20)")
 
-        # ─ Step 7: DB 키워드 매칭 (비하드코딩) ─────────────────
+        # Step 8: DB 키워드
         matched = False
         for kw in vkws:
             if kw in comb:
-                total += 40; reasons.append(f"{sub}:취약kw[{kw[:10]}](+40)")
+                total += 40; reasons.append(f"{sub}:취약kw[{kw[:8]}](+40)")
                 matched = True; break
         if not matched:
             for kw in okws:
                 if kw in comb:
-                    total -= 30; reasons.append(f"{sub}:양호kw[{kw[:10]}](-30)")
+                    total -= 30; reasons.append(f"{sub}:양호kw[{kw[:8]}](-30)")
                     break
 
     total = max(0, min(100, total))
@@ -289,25 +323,123 @@ def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
 
 
 # ──────────────────────────────────────────────────────────
-# JSON 파싱 (3단계 폴백)
+# 프롬프트 빌더 (간결 버전 + 글자수 상한)
+# ──────────────────────────────────────────────────────────
+
+def _truncate(text: str, limit: int) -> str:
+    return text[:limit] + "…" if len(text) > limit else text
+
+
+def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
+    """
+    raw_output 미포함.
+    총 글자수 MAX_PROMPT_CHARS 이하로 제한.
+    """
+    code  = payload.item_code
+    g_std = _DB.standard(code)
+    g_cp  = _DB.check_point(code)
+
+    g_rem = _DB.remediation(code)
+
+    # OS 계열 감지 (remediation에서 명령어 선택 기준)
+    os_name = payload.os_name or ""
+    if any(k in os_name.lower() for k in ("debian", "ubuntu")):
+        os_hint = "Debian/Ubuntu"
+    elif any(k in os_name.lower() for k in ("rhel", "centos", "rocky", "alma")):
+        os_hint = "RHEL 계열"
+    else:
+        os_hint = os_name or "Linux"
+
+    # 헤더
+    header = (
+        f"항목:{code} {payload.item_name}\n"
+        f"OS:{os_hint} | 규칙점수:{rule_score}\n"
+        f"기준:{_truncate(g_std, 500)}\n"
+    )
+    if g_cp:
+        header += f"점검:{_truncate(g_cp, 300)}\n"
+    if g_rem and g_rem not in ("수동 확인 필요", ""):
+        header += f"가이드라인조치:{_truncate(g_rem, 300)}\n"
+
+    # sub_check 블록
+    check_blocks = []
+    for c in payload.check_results:
+        cv = _truncate((c.collected_value or "(없음)").replace("\n", " "), 800)
+        block = (
+            f"[{c.sub_check[:40]}] svc={c.service_status}\n"
+            f" val={cv}\n"
+            f" cmd={c.source_command[:200]}"
+        )
+        check_blocks.append(block)
+
+    body = "\n".join(check_blocks)
+
+    # 총 글자수 제한
+    full = header + body
+    if len(full) > MAX_PROMPT_CHARS:
+        full = full[:MAX_PROMPT_CHARS] + "\n(truncated)"
+
+    return full
+
+
+def _build_batch_prompt(batch: list, rule_scores: dict) -> str:
+    lines = [f"{len(batch)}개 항목:"]
+    for p in batch:
+        code  = p.item_code
+        g_std = _DB.standard(code)
+        rs    = rule_scores.get(code, -1)
+        item_lines = [
+            f"[{code}] {p.item_name} rule={rs}",
+            f" 기준:{_truncate(g_std, 300)}",
+        ]
+        for c in p.check_results:
+            cv = _truncate((c.collected_value or "(없음)").replace("\n", " "), 300)
+            item_lines.append(f" ·{c.sub_check[:30]}[{c.service_status}]:{cv}")
+        lines.append("\n".join(item_lines))
+
+    body = "\n\n".join(lines)
+    if len(body) > MAX_PROMPT_CHARS * BATCH_SIZE:
+        body = body[:MAX_PROMPT_CHARS * BATCH_SIZE] + "\n(truncated)"
+    return body + f"\n\n위 {len(batch)}항목 JSON 배열:"
+
+
+# ──────────────────────────────────────────────────────────
+# 시스템 프롬프트 (간결)
+# ──────────────────────────────────────────────────────────
+
+SINGLE_SYSTEM = (
+    "주통기 보안 점검 전문가. JSON 객체 하나만 출력.\n"
+    '{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",'
+    '"reason":"3~4줄: ①수집된 실제값 직접 인용 ②주통기 기준과 비교 ③취약/양호 근거 ④영향 또는 현황 요약",'
+    '"remediation":"2~3줄: 현재 OS(Debian/Ubuntu 또는 RHEL 등)에 맞는 구체적 명령어 포함. 불필요 서비스는 systemctl disable/stop, 파일권한은 chmod/chown, 설정은 파일경로와 파라미터 명시"}\n'
+    "판정순서: ①service_status ②collected_value→주통기기준비교 ③종합\n"
+    "NOT_INSTALLED→해당없음 | NOT_RUNNING→양호우선 | N/A→파일/설정값만 판단\n"
+    "80+취약 50~79취약가능 20~49양호가능 0~19양호"
+)
+
+BATCH_SYSTEM = (
+    "주통기 보안 점검 전문가. JSON 배열만 출력 (입력 항목 순서 반드시 유지).\n"
+    '[{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",'
+    '"reason":"3줄: 해당 항목 실제 수집값 인용·기준 비교·근거 명시",'
+    '"remediation":"1~2줄: 현재 OS 환경 기준 구체적 명령어 포함"},...]\n'
+    "NOT_INSTALLED/NOT_RUNNING→해당없음 우선 | 80+취약 0~19양호\n"
+    "★ 각 항목은 해당 항목 데이터만 참조 — 다른 항목 데이터 절대 혼용 금지"
+)
+
+
+# ──────────────────────────────────────────────────────────
+# JSON 파싱
 # ──────────────────────────────────────────────────────────
 
 def _parse_single_json(raw: str) -> dict:
     if not raw or not raw.strip():
         return {}
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
-
-    # 1) 전체 파싱
     try:
         d = json.loads(cleaned)
-        if isinstance(d, list) and d:
-            return d[0]
-        if isinstance(d, dict):
-            return d
+        return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except json.JSONDecodeError:
         pass
-
-    # 2) {} 블록 추출
     s, e = cleaned.find("{"), cleaned.rfind("}") + 1
     if s != -1 and e > s:
         try:
@@ -316,14 +448,12 @@ def _parse_single_json(raw: str) -> dict:
                 return d
         except json.JSONDecodeError:
             pass
-
-    # 3) 필드별 정규식 폴백
     result = {}
     for fname, pat in [
         ("vuln_score",  r'"vuln_score"\s*:\s*(\d+)'),
         ("result",      r'"result"\s*:\s*"([^"]+)"'),
-        ("reason",      r'"reason"\s*:\s*"((?:[^"\\]|\\.){0,500})"'),
-        ("remediation", r'"remediation"\s*:\s*"((?:[^"\\]|\\.){0,300})"'),
+        ("reason",      r'"reason"\s*:\s*"((?:[^"\\]|\\.){0,300})"'),
+        ("remediation", r'"remediation"\s*:\s*"((?:[^"\\]|\\.){0,200})"'),
     ]:
         m = re.search(pat, cleaned, re.DOTALL)
         if m:
@@ -336,7 +466,6 @@ def _parse_batch_json(raw: str, batch: list) -> list:
     if not raw or not raw.strip():
         return [{}] * len(batch)
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
-
     s, e = cleaned.find("["), cleaned.rfind("]") + 1
     if s != -1 and e > s:
         try:
@@ -346,196 +475,132 @@ def _parse_batch_json(raw: str, batch: list) -> list:
                 return data[:len(batch)]
         except json.JSONDecodeError:
             pass
-
     results = []
-    for m in re.finditer(r'\{[^{}]+\}', cleaned, re.DOTALL):
-        try:
-            obj = json.loads(m.group())
-            if "item_code" in obj or "vuln_score" in obj:
-                results.append(obj)
-        except json.JSONDecodeError:
-            pass
+    depth, start = 0, -1
+    for i, ch in enumerate(cleaned):
+        if ch == "{":
+            if depth == 0: start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    obj = json.loads(cleaned[start:i + 1])
+                    if isinstance(obj, dict) and ("item_code" in obj or "vuln_score" in obj):
+                        results.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = -1
     while len(results) < len(batch): results.append({})
     return results[:len(batch)]
 
 
 # ──────────────────────────────────────────────────────────
-# LLM 프롬프트
+# Gemini 호출 (Semaphore 적용)
 # ──────────────────────────────────────────────────────────
 
-SINGLE_SYSTEM = """주요통신기반시설(주통기) 보안 취약점 점검 전문가.
-JSON 객체 하나만 출력. 다른 텍스트 절대 없음.
-
-{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",
- "reason":"sub_check별 판정 근거 (실제 설정값·명령 결과 인용), 5줄 이내",
- "remediation":"실행 가능 조치명령 포함, 2줄 이내"}
-
-━━━ 판정 순서 (반드시 이 순서) ━━━
-① service_status 확인 (sub_check별)
-   · NOT_INSTALLED → 서비스 미설치 → 해당없음 가능
-   · NOT_RUNNING   → 서비스 중지 → 취약 위험 낮음, 파일 권한 확인
-   · RUNNING/INSTALLED → 설정 확인 필수
-   · N/A → 서비스 무관, 파일·설정만 확인
-
-② collected_value 확인
-   · "(없음)" 또는 비어있음 → source_command 분석:
-     어떤 명령어인지 보고 "왜 결과가 없는지" 추론
-     그 다음 raw_output으로 실제 결과 재확인
-   · 값이 있으면 → 주통기 판단기준과 직접 비교
-
-③ 전체 sub_check 종합 → 취약/양호/해당없음 최종 판정
-
-━━━ 점수 기준 ━━━
-80+ 명백취약 · 50~79 취약가능 · 20~49 양호가능 · 0~19 명백양호"""
+_semaphore: Optional[asyncio.Semaphore] = None
 
 
-BATCH_SYSTEM = """주요통신기반시설(주통기) 보안 점검 전문가.
-JSON 배열만 출력. 다른 텍스트 없음.
-
-[{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",
-  "reason":"5줄 이내","remediation":"2줄 이내"}, ...]
-
-service_status=NOT_INSTALLED/NOT_RUNNING → 해당없음 우선 고려
-80+ 명백취약 · 50~79 취약가능 · 20~49 양호가능 · 0~19 명백양호"""
+def _get_semaphore() -> asyncio.Semaphore:
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    return _semaphore
 
 
-def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
-    g_std = _DB.standard(payload.item_code)
-    g_cp  = _DB.check_point(payload.item_code)
-    g_rem = _DB.remediation(payload.item_code)
-
-    lines = [
-        "## 점검 항목",
-        f"코드: {payload.item_code}  항목명: {payload.item_name}",
-        f"OS: {payload.os_name}  규칙점수: {rule_score}",
-        "",
-        "## 주통기 기준",
-        f"판단기준: {g_std}",
-    ]
-    if g_cp:
-        lines.append(f"점검방법: {g_cp[:300]}")
-    if g_rem and g_rem != "수동 확인 필요":
-        lines.append(f"조치사항: {g_rem[:200]}")
-
-    lines.append("\n## 수집 데이터")
-    for i, c in enumerate(payload.check_results, 1):
-        cv = (c.collected_value or "(없음)")[:300].replace("\n", " ")
-        raw_lines = [l for l in (c.raw_output or "").splitlines() if l.strip()][:5]
-        raw_summary = " ↵ ".join(raw_lines) if raw_lines else "(없음)"
-
-        lines.append(f"\n[{i}] {c.sub_check}")
-        lines.append(f"  파일/대상: {c.config_file}")
-        lines.append(f"  service_status: {c.service_status}")
-        lines.append(f"  collected_value: {cv}")
-        lines.append(f"  source_command: {c.source_command}")
-        lines.append(f"  raw_output(앞5줄): {raw_summary}")
-
-    lines.append("\nJSON 객체 하나만 응답:")
-    return "\n".join(lines)
-
-
-def _build_batch_prompt(batch: list, rule_scores: dict) -> str:
-    lines = [f"{len(batch)}개 항목 분석:\n"]
-    for i, p in enumerate(batch, 1):
-        g_std = _DB.standard(p.item_code)
-        g_cp  = _DB.check_point(p.item_code)
-        rs    = rule_scores.get(p.item_code, -1)
-        ctx   = [
-            f"[{i}] {p.item_code} {p.item_name} | rule_score={rs} | OS={p.os_name}",
-            f"  기준: {g_std[:120]}",
-        ]
-        if g_cp:
-            ctx.append(f"  점검방법: {g_cp[:80]}")
-        for c in p.check_results:
-            cv = (c.collected_value or "(없음)")[:100].replace("\n", " ")
-            ctx.append(f"  ·{c.sub_check}: {cv} [svc:{c.service_status}]")
-        lines.append("\n".join(ctx))
-    lines.append(f"\n위 {len(batch)}항목 JSON 배열로만 응답:")
-    return "\n\n".join(lines)
-
-
-# ──────────────────────────────────────────────────────────
-# Gemini 호출
-# ──────────────────────────────────────────────────────────
-
-async def _call_single_item(client, payload: JudgePayload, rule_score: int, label: str) -> dict:
+async def _call_single_item(
+    client, payload: JudgePayload, rule_score: int, label: str
+) -> dict:
+    """raw_output 2차 호출 비활성화 — collected_value 기반 판정만."""
     prompt = _build_single_prompt(payload, rule_score)
+    try:
+        with open(PROMPT_DUMP_FILE, "a", encoding="utf-8") as _pf:
+            _pf.write(f"\n{'='*60}\n[{payload.item_code}] {payload.item_name}\n[SYSTEM]\n{SINGLE_SYSTEM}\n[USER]\n{prompt}\n")
+    except Exception:
+        pass
+    est_tokens = max(500, len(prompt) // 3 + 400)
 
-    for attempt in range(1, GEMINI_MAX_RETRY + 1):
-        try:
-            resp = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SINGLE_SYSTEM,
-                    temperature=0.1,
-                    max_output_tokens=700,
-                ),
-            )
-            raw = (resp.text or "") if hasattr(resp, "text") else ""
+    async with _get_semaphore():
+        for attempt in range(1, GEMINI_MAX_RETRY + 1):
+            await _rate_limit_wait(estimated_tokens=est_tokens)
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=_gemini_model(),
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SINGLE_SYSTEM,
+                        temperature=0.1,
+                        max_output_tokens=400,
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                raw = (resp.text or "") if hasattr(resp, "text") else ""
+                if not raw.strip():
+                    print(f"    [경고] {payload.item_code} 빈응답 → 재시도({attempt})")
+                    continue
 
-            if not raw.strip():
-                try:
-                    finish = resp.candidates[0].finish_reason if resp.candidates else "UNKNOWN"
-                except Exception:
-                    finish = "UNKNOWN"
-                print(f"    [경고] {payload.item_code} 빈응답 finish_reason={finish} → 재시도")
-                await asyncio.sleep(GEMINI_REQUEST_DELAY)
-                continue
+                parsed = _parse_single_json(raw)
+                if parsed:
+                    return parsed
+                print(f"    [경고] {payload.item_code} 파싱실패({attempt}): {raw[:60]!r}")
 
-            if not raw.strip().startswith(("{", "[", "`")):
-                print(f"    [경고] {payload.item_code} 비JSON: {raw[:80]!r}")
-
-            parsed = _parse_single_json(raw)
-            if parsed:
-                return parsed
-
-            print(f"    [경고] {payload.item_code} 파싱실패(시도{attempt}): {raw[:80]!r}")
-            await asyncio.sleep(GEMINI_REQUEST_DELAY)
-
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err or "Too Many Requests" in err:
-                wait = GEMINI_RETRY_DELAY * attempt
-                print(f"    [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
-                await asyncio.sleep(wait)
-            else:
-                print(f"    [오류] {label}: {err}")
-                return {}
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    wait = min(120, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
+                    print(f"    [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"    [오류] {label}: {err}")
+                    return {}
 
     print(f"    [실패] {label} 재시도 초과")
     return {}
 
 
-async def _call_batch(client, batch: list, rule_scores: dict, label: str) -> list:
+async def _call_batch(
+    client, batch: list, rule_scores: dict, label: str
+) -> list:
     prompt = _build_batch_prompt(batch, rule_scores)
+    try:
+        codes = ",".join(p.item_code for p in batch)
+        with open(PROMPT_DUMP_FILE, "a", encoding="utf-8") as _pf:
+            _pf.write(f"\n{'='*60}\n[BATCH: {codes}]\n[SYSTEM]\n{BATCH_SYSTEM}\n[USER]\n{prompt}\n")
+    except Exception:
+        pass
+    est_tokens = max(800, len(prompt) // 3 + 300 * len(batch))
 
-    for attempt in range(1, GEMINI_MAX_RETRY + 1):
-        try:
-            resp = await client.aio.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=BATCH_SYSTEM,
-                    temperature=0.1,
-                    max_output_tokens=900 * len(batch),
-                ),
-            )
-            raw = (resp.text or "") if hasattr(resp, "text") else ""
-            if not raw.strip():
-                print(f"    [경고] 배치 빈응답 → 재시도")
-                await asyncio.sleep(GEMINI_REQUEST_DELAY)
-                continue
-            return _parse_batch_json(raw, batch)
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                wait = GEMINI_RETRY_DELAY * attempt
-                print(f"  [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
-                await asyncio.sleep(wait)
-            else:
-                print(f"  [오류] {label}: {err}")
-                return [{}] * len(batch)
+    async with _get_semaphore():
+        for attempt in range(1, GEMINI_MAX_RETRY + 1):
+            await _rate_limit_wait(estimated_tokens=est_tokens)
+            try:
+                resp = await client.aio.models.generate_content(
+                    model=_gemini_model(),
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=BATCH_SYSTEM,
+                        temperature=0.1,
+                        max_output_tokens=350 * len(batch),
+                        thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                raw = (resp.text or "") if hasattr(resp, "text") else ""
+                if not raw.strip():
+                    print(f"    [경고] {label} 빈응답 → 재시도({attempt})")
+                    continue
+                return _parse_batch_json(raw, batch)
+
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    wait = min(120, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
+                    print(f"  [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"  [오류] {label}: {err}")
+                    return [{}] * len(batch)
+
     print(f"  [실패] {label} 재시도 초과")
     return [{}] * len(batch)
 
@@ -544,12 +609,13 @@ async def _call_batch(client, batch: list, rule_scores: dict, label: str) -> lis
 # 최종 판정 조합
 # ──────────────────────────────────────────────────────────
 
-def _finalize(payload: JudgePayload, rule_score: int, rule_reason: str,
-              llm_data: dict, mode: str) -> JudgeResult:
+def _finalize(
+    payload: JudgePayload, rule_score: int, rule_reason: str,
+    llm_data: dict, mode: str
+) -> JudgeResult:
     code      = payload.item_code
     llm_score = int(llm_data.get("vuln_score", 50)) if llm_data else -1
 
-    # ─ 점수 및 근거 계산 ────────────────────────────────────
     if mode == "rule_only" or not llm_data:
         final_score = rule_score
         reason      = f"[규칙] {rule_reason}"
@@ -564,39 +630,25 @@ def _finalize(payload: JudgePayload, rule_score: int, rule_reason: str,
             reason      = f"[규칙] {rule_reason} (LLM실패→규칙대체)"
             remediation = _DB.remediation(code)
         else:
-            final_score = round(rule_score * SCORE_WEIGHT_RULE + llm_score * SCORE_WEIGHT_LLM)
-            note        = f"(규칙{rule_score}×0.6+LLM{llm_score}×0.4={final_score})"
-            reason      = f"[규칙] {rule_reason} | [LLM] {llm_data.get('reason', '')} | {note}"
+            final_score = round(
+                rule_score * SCORE_WEIGHT_RULE + llm_score * SCORE_WEIGHT_LLM
+            )
+            note   = f"(규칙{rule_score}×0.3+LLM{llm_score}×0.7={final_score})"
+            reason = (
+                f"[규칙] {rule_reason} | "
+                f"[LLM] {llm_data.get('reason', '')} | {note}"
+            )
             remediation = llm_data.get("remediation", "수동 확인 필요")
 
-    # ─ LLM 해당없음 명시 시 우선 적용 ──────────────────────
+    # LLM 해당없음 명시 → 우선 적용
     if llm_data and llm_data.get("result") == "해당없음":
-        llm_reason = llm_data.get("reason", "서비스 없음 또는 해당 없음")
-        try:
-            collected_json = json.dumps(
-                [{"sub_check": c.sub_check, "config_file": c.config_file,
-                  "collected_value": c.collected_value, "service_status": c.service_status,
-                  "source_command": c.source_command}
-                 for c in payload.check_results],
-                ensure_ascii=False
-            )
-        except Exception:
-            collected_json = "[]"
-        return JudgeResult(
-            scan_id=payload.scan_id, item_code=code,
-            item_name=payload.item_name,
-            guideline_ref=f"주통기 Unix 서버 {code}",
-            result="해당없음",
-            reason=f"[LLM] {llm_reason}",
-            remediation="해당 없음", confidence=0.9,
-            os_name=getattr(payload, "os_name", ""),
-            category=_DB.category(code) or getattr(payload, "category", ""),
-            severity=_DB.severity(code),
-            judge_mode=mode,
-            collected_json=collected_json,
+        return _make_result(
+            payload, code, "해당없음",
+            f"[LLM] {llm_data.get('reason', '해당없음')}",
+            "해당 없음", 0.9, mode
         )
 
-    # ─ 최종 결과 결정 ───────────────────────────────────────
+    # 점수 → 결과
     if final_score >= THRESHOLD_VULN:
         result = "취약"
         conf   = round(min(1.0, final_score / 100), 2)
@@ -608,13 +660,18 @@ def _finalize(payload: JudgePayload, rule_score: int, rule_reason: str,
         conf   = 0.5
         reason = f"[검토필요→취약] {reason}"
 
-    reason = " | ".join(reason.split(" | ")[:5])
+    reason = " | ".join(reason.split(" | ")[:4])
+    return _make_result(payload, code, result, reason, remediation, conf, mode)
 
-    # ─ collected_json 직렬화 ────────────────────────────────
+
+def _make_result(
+    payload, code, result, reason, remediation, confidence, mode
+) -> JudgeResult:
     try:
         collected_json = json.dumps(
             [{"sub_check": c.sub_check, "config_file": c.config_file,
-              "collected_value": c.collected_value, "service_status": c.service_status,
+              "collected_value": c.collected_value,
+              "service_status": c.service_status,
               "source_command": c.source_command}
              for c in payload.check_results],
             ensure_ascii=False
@@ -623,16 +680,19 @@ def _finalize(payload: JudgePayload, rule_score: int, rule_reason: str,
         collected_json = "[]"
 
     return JudgeResult(
-        scan_id=payload.scan_id, item_code=code,
-        item_name=payload.item_name,
-        guideline_ref=f"주통기 Unix 서버 {code}",
-        result=result, reason=reason,
-        remediation=remediation, confidence=conf,
-        os_name=getattr(payload, "os_name", ""),
-        category=_DB.category(code) or getattr(payload, "category", ""),
-        severity=_DB.severity(code),
-        judge_mode=mode,
-        collected_json=collected_json,
+        scan_id       = payload.scan_id,
+        item_code     = code,
+        item_name     = payload.item_name,
+        guideline_ref = f"주통기 Unix 서버 {code}",
+        result        = result,
+        reason        = reason,
+        remediation   = remediation,
+        confidence    = confidence,
+        os_name       = getattr(payload, "os_name", ""),
+        category      = _DB.category(code) or getattr(payload, "category", ""),
+        severity      = _DB.severity(code),
+        judge_mode    = mode,
+        collected_json= collected_json,
     )
 
 
@@ -646,9 +706,9 @@ class BatchJudge:
         results = asyncio.run(BatchJudge.run(payloads, mode="hybrid"))
 
     judge_mode:
-        "hybrid"    규칙×0.6 + LLM×0.4  (기본)
-        "rule_only" LLM 없음 (논문 실험/빠른 테스트)
-        "llm_only"  규칙 무시 (논문 실험용)
+        "hybrid"    규칙×0.3 + LLM×0.7  (기본)
+        "rule_only" LLM 없음
+        "llm_only"  규칙 무시
     """
 
     @staticmethod
@@ -657,13 +717,28 @@ class BatchJudge:
         api_key: Optional[str] = None,
         mode: str = "hybrid",
     ) -> list:
-        if api_key is None:
+        global _semaphore
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        global _rl_window, _rl_tpm_used, _rl_tpm_reset
+        _rl_window     = []
+        _rl_tpm_used   = 0
+        _rl_tpm_reset  = _time.time()
+        _DB._cache.clear()
+        scan_id_for_dump = os.getenv("SCAN_ID", "unknown")
+        try:
+            with open(PROMPT_DUMP_FILE, "w", encoding="utf-8") as _pf:
+                _pf.write(f"# 프롬프트 덤프 — scan_id={scan_id_for_dump}\n")
+        except Exception:
+            pass
+
+        if not api_key:
             api_key = _get_api_key()
 
-        # ── 1단계: 규칙 평가 및 분류 ──
-        certain:         list = []   # 규칙 확정 취약
-        confirmed_ok:    list = []   # 규칙 확정 양호 → 배치 LLM
-        need_individual: list = []   # 불확실/취약 → 개별 LLM
+        # ── 1단계: 규칙 분류 ──────────────────────────────────
+        not_installed:   list = []
+        certain:         list = []
+        confirmed_ok:    list = []
+        need_individual: list = []
         rule_map:        dict = {}
 
         for p in payloads:
@@ -672,6 +747,8 @@ class BatchJudge:
 
             if mode == "rule_only":
                 certain.append((p, score, reason))
+            elif score == -1:
+                not_installed.append((p, reason))
             elif conclusive and score >= RULE_CERTAIN_VULN:
                 certain.append((p, score, reason))
             elif conclusive and score < THRESHOLD_VULN:
@@ -679,23 +756,34 @@ class BatchJudge:
             else:
                 need_individual.append(p)
 
-        n_ok_batches = (len(confirmed_ok) + BATCH_SIZE - 1) // BATCH_SIZE if confirmed_ok else 0
-        eta = (n_ok_batches + len(need_individual)) * (GEMINI_REQUEST_DELAY + 5)
+        n_ok_batches  = (len(confirmed_ok) + BATCH_SIZE - 1) // BATCH_SIZE
+        n_llm_calls   = n_ok_batches + len(need_individual)
+        eta = n_llm_calls * 15
 
         print(
-            f"[BatchJudge] mode={mode} | model={GEMINI_MODEL}\n"
-            f"  전체={len(payloads)} | 규칙확정취약={len(certain)} | "
-            f"확정양호(배치LLM)={len(confirmed_ok)}({n_ok_batches}배치) | "
+            f"[BatchJudge] mode={mode} | model={_gemini_model()}\n"
+            f"  전체={len(payloads)} | 미설치={len(not_installed)} | "
+            f"확정취약={len(certain)} | "
+            f"확정양호(배치)={len(confirmed_ok)}({n_ok_batches}배치) | "
             f"개별LLM={len(need_individual)}\n"
+            f"  MAX_CONCURRENT={MAX_CONCURRENT} BATCH_SIZE={BATCH_SIZE} "
+            f"MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}\n"
             f"  예상≈{eta:.0f}초({eta/60:.1f}분)"
         )
 
-        # ── 2단계: 규칙 확정 취약 즉시 처리 ──
         results: list = []
+
+        # ── 2단계: 미설치 → 해당없음 ─────────────────────────
+        for p, reason in not_installed:
+            r = _finalize(p, 0, reason, {"result": "해당없음", "reason": reason}, mode)
+            results.append(r)
+            print(f"  [해당없음] {p.item_code} (미설치)")
+
+        # ── 3단계: 확정 취약 즉시 처리 ───────────────────────
         for p, score, reason in certain:
             r = _finalize(p, score, reason, {}, mode)
             results.append(r)
-            print(f"  [확정취약] {p.item_code}({score}점) → {r.result}")
+            print(f"  [확정취약] {p.item_code}({score}점)")
 
         if not (confirmed_ok or need_individual) or not api_key:
             if not api_key and (confirmed_ok or need_individual):
@@ -709,36 +797,34 @@ class BatchJudge:
         client = genai.Client(api_key=api_key)
         rule_scores_map = {c: s for c, (s, _) in rule_map.items()}
 
-        # ── 3단계: 확정 양호 → 순차 배치 LLM ──
+        # ── 4단계: 확정 양호 → 배치 LLM (순차) ──────────────
         if confirmed_ok:
-            print(f"\n[배치LLM] 확정양호 {len(confirmed_ok)}건...")
+            print(f"\n[배치LLM] {len(confirmed_ok)}건 ({n_ok_batches}배치)...")
             for bi, bs in enumerate(range(0, len(confirmed_ok), BATCH_SIZE)):
                 batch = confirmed_ok[bs:bs + BATCH_SIZE]
                 codes = ",".join(p.item_code for p in batch)
-                label = f"양호배치{bi+1}[{codes}]"
+                label = f"배치{bi+1}/{n_ok_batches}[{codes}]"
                 print(f"  {label}")
                 batch_out = await _call_batch(client, batch, rule_scores_map, label)
                 for p, llm_d in zip(batch, batch_out):
                     score, reason = rule_map[p.item_code]
                     r = _finalize(p, score, reason, llm_d or {}, mode)
                     results.append(r)
-                    print(f"    {p.item_code}: 규칙={score} LLM={(llm_d or {}).get('vuln_score','N/A')} → {r.result}({r.confidence:.0%})")
-                if bs + BATCH_SIZE < len(confirmed_ok):
-                    await asyncio.sleep(GEMINI_REQUEST_DELAY)
+                    vs = (llm_d or {}).get("vuln_score", "N/A")
+                    print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
 
-        # ── 4단계: 불확실/취약 → 개별 LLM ──
+        # ── 5단계: 불확실 → 개별 LLM (순차, MAX_CONCURRENT=1로 버스트 방지) ─
         if need_individual:
-            print(f"\n[개별LLM] {len(need_individual)}건 순차 처리...")
+            print(f"\n[개별LLM] {len(need_individual)}건 (순차 처리)...")
             for idx, p in enumerate(need_individual, 1):
                 score, reason = rule_map[p.item_code]
                 label = f"개별{idx}/{len(need_individual)}[{p.item_code}]"
-                print(f"  [LLM] {label} (규칙={score})")
+                print(f"  {label}")
                 llm_d = await _call_single_item(client, p, score, label)
-                r = _finalize(p, score, reason, llm_d, mode)
+                r = _finalize(p, score, reason, llm_d or {}, mode)
                 results.append(r)
-                print(f"    → 규칙={score} LLM={(llm_d or {}).get('vuln_score','N/A')} 최종={r.result}({r.confidence:.0%})")
-                if idx < len(need_individual):
-                    await asyncio.sleep(GEMINI_REQUEST_DELAY)
+                vs = (llm_d or {}).get("vuln_score", "N/A")
+                print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
 
         # 원래 순서 복원
         order = {p.item_code: i for i, p in enumerate(payloads)}
@@ -752,3 +838,39 @@ def _print_summary(results: list):
     ok   = sum(1 for r in results if r.result == "양호")
     na   = sum(1 for r in results if r.result == "해당없음")
     print(f"\n[BatchJudge] 완료: 전체={len(results)} 취약={vuln} 양호={ok} 해당없음={na}")
+
+
+# ──────────────────────────────────────────────────────────
+# 디버그: 프롬프트 출력 (LLM 호출 없음)
+# ──────────────────────────────────────────────────────────
+
+def debug_print_prompt(payload: JudgePayload):
+    score, reason, conclusive = _rule_score(payload)
+    print("=" * 70)
+    print(f"[디버그] {payload.item_code} | 규칙점수={score} | conclusive={conclusive}")
+    print(f"[디버그] 규칙판단: {reason}")
+    print("=" * 70)
+    print("[SYSTEM PROMPT]")
+    print(SINGLE_SYSTEM)
+    print("-" * 70)
+    print("[USER PROMPT]")
+    print(_build_single_prompt(payload, score))
+    print(f"\n[글자수: {len(_build_single_prompt(payload, score))} / {MAX_PROMPT_CHARS}]")
+    print("=" * 70)
+
+
+def debug_print_batch_prompt(payloads: list):
+    rule_scores = {}
+    for p in payloads:
+        score, reason, _ = _rule_score(p)
+        rule_scores[p.item_code] = score
+        print(f"[규칙] {p.item_code}: score={score} | {reason}")
+    print("=" * 70)
+    print("[BATCH SYSTEM PROMPT]")
+    print(BATCH_SYSTEM)
+    print("-" * 70)
+    print("[BATCH USER PROMPT]")
+    prompt = _build_batch_prompt(payloads, rule_scores)
+    print(prompt)
+    print(f"\n[글자수: {len(prompt)} / {MAX_PROMPT_CHARS * BATCH_SIZE}]")
+    print("=" * 70)

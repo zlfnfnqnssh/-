@@ -120,8 +120,8 @@ class ScriptRunner:
             print(f"[Runner] 경고: 스크립트 폴더 없음 → {script_dir}")
             return []
 
-        # u01.py, u02.py ... 파일 수집
-        all_scripts = sorted(script_dir.glob("u*.py"))
+        # U-01.py, U-02.py ... 파일 수집 (대소문자 모두 매칭)
+        all_scripts = sorted(script_dir.glob("[Uu]*.py"))
 
         if item_codes is None:
             return all_scripts
@@ -245,8 +245,8 @@ class ScriptRunner:
             print("[Runner] 실행할 스크립트가 없습니다.")
             return []
 
-        # 전체 실행에 공통 scan_id 부여 (스크립트 실행 전 1회 생성)
-        common_scan_id = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # 외부에서 SCAN_ID 환경변수로 전달된 경우 그 값 사용, 없으면 새로 생성
+        common_scan_id = os.environ.get("SCAN_ID") or f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         os.environ["SCAN_ID"] = common_scan_id
 
         results = []
