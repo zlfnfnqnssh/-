@@ -1,20 +1,20 @@
 """
-batch_judge.py  (v7)
+batch_judge.py  (v9)
 --------------------
 규칙/LLM 하이브리드 판정 엔진.
 
-변경사항 (v7):
-  1. raw_output 2차 호출 비활성화 (include_raw 항상 False)
-  2. 프롬프트 길이 대폭 축소 + 총 글자수 상한 제어 (MAX_PROMPT_CHARS)
-  3. asyncio.Semaphore 기반 동시 호출 제어 (MAX_CONCURRENT)
-  4. BATCH_SIZE 기본값 3으로 축소
+변경사항 (v9):
+  1. Vertex AI 코드 완전 제거 — AI Studio(유료) 단일 백엔드
+  2. gemini-2.5-flash + thinking_budget=0 — 비용 제어 (thinking 활성 시 15× 비싸짐)
+  3. 유료 AI Studio 기준 rate limit 완화 (1000 RPM → delay 3초, 20 RPM 운용)
+  4. 예상 비용: 72항목 × ~800토큰 ≈ 23 KRW per run
 
 흐름:
   1단계 규칙 엔진 → 분류
     ├─ 전체 미설치              → 즉시 해당없음 (LLM 없음)
     ├─ 규칙 확정 취약 (≥85)    → 즉시 취약 (LLM 없음)
-    ├─ 규칙 확정 양호 (conclusive, <70) → 배치 LLM
-    └─ 불확실                   → 개별 LLM
+    ├─ 규칙 확정 양호 (conclusive, <70) → 개별 LLM (1항목 1요청)
+    └─ 불확실                   → 개별 LLM (1항목 1요청)
 
 서비스 상태값:
   RUNNING / NOT_RUNNING / NOT_INSTALLED / INSTALLED / N/A
@@ -39,29 +39,33 @@ load_dotenv()
 # 설정
 # ──────────────────────────────────────────────────────────
 
+# gemini-2.5-flash — AI Studio 유료(pay-as-you-go): 1000 RPM / 4M TPM
+# thinking_budget=0 필수: 기본 활성 시 출력 비용 15× 증가 ($0.60 → $3.50/1M)
 GEMINI_MODEL_DEFAULT = "gemini-2.5-flash"
 
 
 def _gemini_model() -> str:
-    """매 호출 시 .env 변경이 반영되도록 런타임에 읽음."""
     return os.getenv("GEMINI_MODEL", GEMINI_MODEL_DEFAULT)
 
-GEMINI_RETRY_DELAY = float(os.getenv("GEMINI_RETRY_DELAY", "65"))
-GEMINI_MAX_RETRY   = int(os.getenv("GEMINI_MAX_RETRY",   "4"))
-BATCH_SIZE         = int(os.getenv("BATCH_SIZE",         "3"))   # 확정양호 배치 크기 (할루시네이션 방지)
+# 429 후 첫 대기(초) — 지수 백오프: 30 → 60 → 120
+GEMINI_RETRY_DELAY = float(os.getenv("GEMINI_RETRY_DELAY", "30.0"))
+GEMINI_MAX_RETRY   = int(os.getenv("GEMINI_MAX_RETRY",   "3"))
 RULE_CERTAIN_VULN  = int(os.getenv("RULE_CERTAIN_VULN",  "85"))
 GUIDELINE_DB_PATH  = os.getenv("GUIDELINE_DB_PATH",   "./db/guidelines.db")
 
-# 동시 호출 제한 — 개별 항목은 순차(1)로, 버스트 방지
-MAX_CONCURRENT     = int(os.getenv("MAX_CONCURRENT",  "1"))
+# LLM 호출은 순차(1) 고정 — 이벤트루프 충돌 방지
+MAX_CONCURRENT     = 1
 
-# 프롬프트 총 글자수 상한 (초과 시 truncate) — Gemini 2.5 Flash 1M 토큰 고려하여 넉넉히
-MAX_PROMPT_CHARS   = int(os.getenv("MAX_PROMPT_CHARS", "8000"))
+# 프롬프트 총 글자수 상한
+MAX_PROMPT_CHARS   = int(os.getenv("MAX_PROMPT_CHARS", "4000"))
 
 # RPM / TPM 상한 (Rate Limiter)
-MAX_RPM            = int(os.getenv("MAX_RPM",   "9"))
-MAX_TPM            = int(os.getenv("MAX_TPM",   "200000"))
-REQUEST_MIN_DELAY  = float(os.getenv("REQUEST_MIN_DELAY", "7.0"))  # 10 RPM 안전마진
+# 유료 AI Studio 1000 RPM / 4M TPM 기준
+# REQUEST_MIN_DELAY=3 → 20 RPM, 여유율 98%
+# 72항목 × 3초 ≈ 3.6분, 예상 비용 ≈ 23 KRW
+MAX_RPM            = int(os.getenv("MAX_RPM",   "20"))
+MAX_TPM            = int(os.getenv("MAX_TPM",   "2000000"))
+REQUEST_MIN_DELAY  = float(os.getenv("REQUEST_MIN_DELAY", "3.0"))
 PROMPT_DUMP_FILE   = os.getenv("PROMPT_DUMP_FILE", "/tmp/syeon_prompts_latest.txt")
 
 SCORE_WEIGHT_RULE  = 0.30
@@ -75,7 +79,7 @@ def _get_api_key() -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# Rate Limiter (모듈 레벨)
+# Rate Limiter (모듈 레벨 — 순차 처리이므로 Lock 불필요)
 # ──────────────────────────────────────────────────────────
 
 _rl_window:    list  = []
@@ -83,8 +87,18 @@ _rl_tpm_used:  int   = 0
 _rl_tpm_reset: float = 0.0
 
 
+def _reset_rl_window():
+    """429 복구 후 rate limiter 윈도우 초기화 — 재개 시 버스트 방지."""
+    global _rl_window, _rl_tpm_used, _rl_tpm_reset
+    _rl_window    = []
+    _rl_tpm_used  = 0
+    _rl_tpm_reset = _time.time()
+
+
 async def _rate_limit_wait(estimated_tokens: int = 2000):
-    """RPM / TPM 한도 초과 예상 시 다음 분까지 대기."""
+    """RPM / TPM 한도 초과 예상 시 다음 분까지 대기.
+    MAX_CONCURRENT=1 순차 처리이므로 Lock 없이 직접 실행.
+    """
     global _rl_window, _rl_tpm_used, _rl_tpm_reset
 
     now = _time.time()
@@ -112,6 +126,7 @@ async def _rate_limit_wait(estimated_tokens: int = 2000):
             _rl_tpm_used  = 0
             _rl_tpm_reset = _time.time()
 
+    # 항목 간 최소 딜레이 (RPM 안전 간격)
     if REQUEST_MIN_DELAY > 0:
         await asyncio.sleep(REQUEST_MIN_DELAY)
     _rl_window.append(_time.time())
@@ -331,17 +346,10 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
-    """
-    raw_output 미포함.
-    총 글자수 MAX_PROMPT_CHARS 이하로 제한.
-    """
-    code  = payload.item_code
-    g_std = _DB.standard(code)
-    g_cp  = _DB.check_point(code)
+    code    = payload.item_code
+    g_std   = _DB.standard(code)
+    g_cp    = _DB.check_point(code)
 
-    g_rem = _DB.remediation(code)
-
-    # OS 계열 감지 (remediation에서 명령어 선택 기준)
     os_name = payload.os_name or ""
     if any(k in os_name.lower() for k in ("debian", "ubuntu")):
         os_hint = "Debian/Ubuntu"
@@ -350,80 +358,102 @@ def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
     else:
         os_hint = os_name or "Linux"
 
-    # 헤더
-    header = (
-        f"항목:{code} {payload.item_name}\n"
-        f"OS:{os_hint} | 규칙점수:{rule_score}\n"
-        f"기준:{_truncate(g_std, 500)}\n"
-    )
+    lines = [
+        f"[점검항목] {code}: {payload.item_name}",
+        f"[OS] {os_hint}  [규칙사전점수] {rule_score}/100",
+        f"[주통기기준] {_truncate(g_std, 300)}",
+    ]
     if g_cp:
-        header += f"점검:{_truncate(g_cp, 300)}\n"
-    if g_rem and g_rem not in ("수동 확인 필요", ""):
-        header += f"가이드라인조치:{_truncate(g_rem, 300)}\n"
+        lines.append(f"[점검포인트] {_truncate(g_cp, 200)}")
 
-    # sub_check 블록
-    check_blocks = []
-    for c in payload.check_results:
-        cv = _truncate((c.collected_value or "(없음)").replace("\n", " "), 800)
-        block = (
-            f"[{c.sub_check[:40]}] svc={c.service_status}\n"
-            f" val={cv}\n"
-            f" cmd={c.source_command[:200]}"
-        )
-        check_blocks.append(block)
+    lines.append("")
+    lines.append("[수집결과] ← 아래 값만 근거로 판정할 것")
+    for i, c in enumerate(payload.check_results, 1):
+        cv = _truncate((c.collected_value or "(없음)").replace("\n", " "), 600)
+        lines.append(f"  ({i}) {c.sub_check[:40]}")
+        lines.append(f"      service_status: {c.service_status}")
+        lines.append(f"      collected_value: {cv}")
 
-    body = "\n".join(check_blocks)
+    lines.append("")
+    lines.append("※ 수집결과에 없는 내용 추가 금지. JSON만 출력.")
 
-    # 총 글자수 제한
-    full = header + body
+    full = "\n".join(lines)
     if len(full) > MAX_PROMPT_CHARS:
-        full = full[:MAX_PROMPT_CHARS] + "\n(truncated)"
-
+        full = full[:MAX_PROMPT_CHARS] + "\n(이하생략)"
     return full
 
 
 def _build_batch_prompt(batch: list, rule_scores: dict) -> str:
-    lines = [f"{len(batch)}개 항목:"]
-    for p in batch:
+    total = len(batch)
+    sections = []
+    for n, p in enumerate(batch, 1):
         code  = p.item_code
         g_std = _DB.standard(code)
         rs    = rule_scores.get(code, -1)
+        # 항목 번호와 코드를 강조한 구분선으로 격리 — 할루시네이션 방지
         item_lines = [
-            f"[{code}] {p.item_name} rule={rs}",
-            f" 기준:{_truncate(g_std, 300)}",
+            f"{'━'*6}[ITEM {n}/{total}: {code}]{'━'*6}",
+            f"항목명: {p.item_name}",
+            f"규칙점수: {rs} | 기준: {_truncate(g_std, 300)}",
         ]
         for c in p.check_results:
             cv = _truncate((c.collected_value or "(없음)").replace("\n", " "), 300)
-            item_lines.append(f" ·{c.sub_check[:30]}[{c.service_status}]:{cv}")
-        lines.append("\n".join(item_lines))
+            item_lines.append(f" ▸ {c.sub_check[:30]}[{c.service_status}]: {cv}")
+        sections.append("\n".join(item_lines))
 
-    body = "\n\n".join(lines)
+    body = "\n\n".join(sections)
     if len(body) > MAX_PROMPT_CHARS * BATCH_SIZE:
         body = body[:MAX_PROMPT_CHARS * BATCH_SIZE] + "\n(truncated)"
-    return body + f"\n\n위 {len(batch)}항목 JSON 배열:"
+
+    # 출력 순서를 명시하여 항목 혼동 방지
+    mapping = " / ".join(f"ITEM{i+1}→{p.item_code}" for i, p in enumerate(batch))
+    return (
+        body
+        + f"\n\n위 {total}개 항목을 반드시 ITEM 번호 순서대로 판정하세요. ({mapping})\n"
+        f"JSON 배열 {total}개 출력 (item_code 생략 불가):"
+    )
 
 
 # ──────────────────────────────────────────────────────────
 # 시스템 프롬프트 (간결)
 # ──────────────────────────────────────────────────────────
 
-SINGLE_SYSTEM = (
-    "주통기 보안 점검 전문가. JSON 객체 하나만 출력.\n"
-    '{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",'
-    '"reason":"3~4줄: ①수집된 실제값 직접 인용 ②주통기 기준과 비교 ③취약/양호 근거 ④영향 또는 현황 요약",'
-    '"remediation":"2~3줄: 현재 OS(Debian/Ubuntu 또는 RHEL 등)에 맞는 구체적 명령어 포함. 불필요 서비스는 systemctl disable/stop, 파일권한은 chmod/chown, 설정은 파일경로와 파라미터 명시"}\n'
-    "판정순서: ①service_status ②collected_value→주통기기준비교 ③종합\n"
-    "NOT_INSTALLED→해당없음 | NOT_RUNNING→양호우선 | N/A→파일/설정값만 판단\n"
-    "80+취약 50~79취약가능 20~49양호가능 0~19양호"
-)
+SINGLE_SYSTEM = """\
+주통기 Unix 서버 보안 점검 전문가.
+
+[출력 형식 — 절대 규칙]
+1. 백틱(`) · 코드블록(```json) 사용 절대 금지 — JSON 객체만 바로 출력
+2. JSON 객체 1개만 출력 — 앞뒤 설명 텍스트 금지
+3. 문자열 값 안 줄바꿈(\\n) 금지 — 한 줄 텍스트로 작성
+4. 필드 순서 고정: item_code → vuln_score → result → reason → remediation
+
+[JSON 스키마]
+{"item_code":"U-XX","vuln_score":정수0~100,"result":"취약|양호|해당없음","reason":"수집값인용+기준비교+판정근거(120자이내)","remediation":"현재OS맞는조치명령어(80자이내)"}
+
+[판정 기준]
+- NOT_INSTALLED → result="해당없음", vuln_score=0
+- NOT_RUNNING   → result="양호" 우선 (설정값 확인 후 최종 결정)
+- N/A           → collected_value 값만으로 판단
+- vuln_score 80+ → result="취약"
+- vuln_score 20- → result="양호"
+- 20~79 → collected_value 분석 결과로 결정 (애매하면 취약 보수적 처리)
+
+[할루시네이션 방지 — 반드시 준수]
+- 수집된 collected_value 에 없는 내용 추가 절대 금지
+- 추측·가정 금지 — 실제 수집값만 근거로 사용
+- 파일/서비스가 없으면 해당없음 또는 양호로 처리, 임의로 취약 판정 금지\
+"""
 
 BATCH_SYSTEM = (
-    "주통기 보안 점검 전문가. JSON 배열만 출력 (입력 항목 순서 반드시 유지).\n"
+    "주통기 보안 점검 전문가. JSON 배열만 출력 (입력 ITEM 번호 순서 반드시 유지).\n"
     '[{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",'
     '"reason":"3줄: 해당 항목 실제 수집값 인용·기준 비교·근거 명시",'
     '"remediation":"1~2줄: 현재 OS 환경 기준 구체적 명령어 포함"},...]\n'
     "NOT_INSTALLED/NOT_RUNNING→해당없음 우선 | 80+취약 0~19양호\n"
-    "★ 각 항목은 해당 항목 데이터만 참조 — 다른 항목 데이터 절대 혼용 금지"
+    "⚠️ 항목 격리 규칙 (절대 준수):\n"
+    "  · 각 항목은 ━━[ITEM N/T: CODE]━━ 블록 안의 데이터만 참조\n"
+    "  · 다른 항목의 수집값·판단 절대 혼용 금지 — 항목 간 데이터 교차 참조 불가\n"
+    "  · 입력 ITEM 순서 그대로 정확히 N개 결과 출력 (누락·순서변경·item_code 오기 불가)"
 )
 
 
@@ -434,12 +464,19 @@ BATCH_SYSTEM = (
 def _parse_single_json(raw: str) -> dict:
     if not raw or not raw.strip():
         return {}
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+
+    # 1) 코드블록 제거 (```json ... ``` 또는 ``` ... ```)
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw)
+    cleaned = re.sub(r"```", "", cleaned).strip()
+
+    # 2) 직접 파싱 시도
     try:
         d = json.loads(cleaned)
         return d[0] if isinstance(d, list) and d else (d if isinstance(d, dict) else {})
     except json.JSONDecodeError:
         pass
+
+    # 3) { } 범위 추출 후 파싱
     s, e = cleaned.find("{"), cleaned.rfind("}") + 1
     if s != -1 and e > s:
         try:
@@ -448,6 +485,20 @@ def _parse_single_json(raw: str) -> dict:
                 return d
         except json.JSONDecodeError:
             pass
+
+    # 4) 잘린 JSON 복구 시도 (max_output_tokens 초과로 닫는 } 없을 때)
+    if s != -1:
+        fragment = cleaned[s:].rstrip().rstrip(",")
+        if not fragment.endswith("}"):
+            fragment += '"}'  # 마지막 값이 잘렸으면 닫기 시도
+        try:
+            d = json.loads(fragment)
+            if isinstance(d, dict):
+                return d
+        except json.JSONDecodeError:
+            pass
+
+    # 5) 정규식 필드별 추출 (최후 수단)
     result = {}
     for fname, pat in [
         ("vuln_score",  r'"vuln_score"\s*:\s*(\d+)'),
@@ -496,23 +547,13 @@ def _parse_batch_json(raw: str, batch: list) -> list:
 
 
 # ──────────────────────────────────────────────────────────
-# Gemini 호출 (Semaphore 적용)
+# Gemini 호출 (순차 처리 — Semaphore 불필요)
 # ──────────────────────────────────────────────────────────
-
-_semaphore: Optional[asyncio.Semaphore] = None
-
-
-def _get_semaphore() -> asyncio.Semaphore:
-    global _semaphore
-    if _semaphore is None:
-        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    return _semaphore
-
 
 async def _call_single_item(
     client, payload: JudgePayload, rule_score: int, label: str
 ) -> dict:
-    """raw_output 2차 호출 비활성화 — collected_value 기반 판정만."""
+    """1항목 1요청. collected_value 기반 판정."""
     prompt = _build_single_prompt(payload, rule_score)
     try:
         with open(PROMPT_DUMP_FILE, "a", encoding="utf-8") as _pf:
@@ -521,39 +562,44 @@ async def _call_single_item(
         pass
     est_tokens = max(500, len(prompt) // 3 + 400)
 
-    async with _get_semaphore():
-        for attempt in range(1, GEMINI_MAX_RETRY + 1):
-            await _rate_limit_wait(estimated_tokens=est_tokens)
-            try:
-                resp = await client.aio.models.generate_content(
-                    model=_gemini_model(),
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SINGLE_SYSTEM,
-                        temperature=0.1,
-                        max_output_tokens=400,
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                raw = (resp.text or "") if hasattr(resp, "text") else ""
-                if not raw.strip():
-                    print(f"    [경고] {payload.item_code} 빈응답 → 재시도({attempt})")
-                    continue
+    for attempt in range(1, GEMINI_MAX_RETRY + 1):
+        await _rate_limit_wait(estimated_tokens=est_tokens)
+        try:
+            resp = await client.aio.models.generate_content(
+                model=_gemini_model(),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SINGLE_SYSTEM,
+                    temperature=0.1,
+                    max_output_tokens=600,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            raw = (resp.text or "") if hasattr(resp, "text") else ""
+            if not raw.strip():
+                print(f"    [경고] {payload.item_code} 빈응답 → 재시도({attempt})")
+                continue
 
-                parsed = _parse_single_json(raw)
-                if parsed:
-                    return parsed
-                print(f"    [경고] {payload.item_code} 파싱실패({attempt}): {raw[:60]!r}")
+            parsed = _parse_single_json(raw)
+            if parsed:
+                return parsed
+            print(f"    [경고] {payload.item_code} 파싱실패({attempt}): {raw!r}")
 
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    wait = min(120, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
-                    print(f"    [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
-                    await asyncio.sleep(wait)
-                else:
-                    print(f"    [오류] {label}: {err}")
-                    return {}
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                wait = min(300, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
+                print(f"    [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                await asyncio.sleep(wait)
+                _reset_rl_window()
+            elif "503" in err or "UNAVAILABLE" in err:
+                wait = min(60, 15 * attempt)
+                print(f"    [503] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                await asyncio.sleep(wait)
+            else:
+                print(f"    [오류] {label}: {err}")
+                return {}
 
     print(f"    [실패] {label} 재시도 초과")
     return {}
@@ -571,35 +617,39 @@ async def _call_batch(
         pass
     est_tokens = max(800, len(prompt) // 3 + 300 * len(batch))
 
-    async with _get_semaphore():
-        for attempt in range(1, GEMINI_MAX_RETRY + 1):
-            await _rate_limit_wait(estimated_tokens=est_tokens)
-            try:
-                resp = await client.aio.models.generate_content(
-                    model=_gemini_model(),
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=BATCH_SYSTEM,
-                        temperature=0.1,
-                        max_output_tokens=350 * len(batch),
-                        thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                raw = (resp.text or "") if hasattr(resp, "text") else ""
-                if not raw.strip():
-                    print(f"    [경고] {label} 빈응답 → 재시도({attempt})")
-                    continue
-                return _parse_batch_json(raw, batch)
+    for attempt in range(1, GEMINI_MAX_RETRY + 1):
+        await _rate_limit_wait(estimated_tokens=est_tokens)
+        try:
+            resp = await client.aio.models.generate_content(
+                model=_gemini_model(),
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=BATCH_SYSTEM,
+                    temperature=0.1,
+                    max_output_tokens=350 * len(batch),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                ),
+            )
+            raw = (resp.text or "") if hasattr(resp, "text") else ""
+            if not raw.strip():
+                print(f"    [경고] {label} 빈응답 → 재시도({attempt})")
+                continue
+            return _parse_batch_json(raw, batch)
 
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    wait = min(120, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
-                    print(f"  [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
-                    await asyncio.sleep(wait)
-                else:
-                    print(f"  [오류] {label}: {err}")
-                    return [{}] * len(batch)
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                wait = min(300, GEMINI_RETRY_DELAY * (2 ** (attempt - 1)))
+                print(f"  [429] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                await asyncio.sleep(wait)
+                _reset_rl_window()
+            elif "503" in err or "UNAVAILABLE" in err:
+                wait = min(60, 15 * attempt)
+                print(f"  [503] {label} → {wait:.0f}초 대기 ({attempt}/{GEMINI_MAX_RETRY})")
+                await asyncio.sleep(wait)
+            else:
+                print(f"  [오류] {label}: {err}")
+                return [{}] * len(batch)
 
     print(f"  [실패] {label} 재시도 초과")
     return [{}] * len(batch)
@@ -717,8 +767,6 @@ class BatchJudge:
         api_key: Optional[str] = None,
         mode: str = "hybrid",
     ) -> list:
-        global _semaphore
-        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         global _rl_window, _rl_tpm_used, _rl_tpm_reset
         _rl_window     = []
         _rl_tpm_used   = 0
@@ -756,17 +804,16 @@ class BatchJudge:
             else:
                 need_individual.append(p)
 
-        n_ok_batches  = (len(confirmed_ok) + BATCH_SIZE - 1) // BATCH_SIZE
-        n_llm_calls   = n_ok_batches + len(need_individual)
-        eta = n_llm_calls * 15
+        n_llm_calls   = len(confirmed_ok) + len(need_individual)
+        eta = n_llm_calls * REQUEST_MIN_DELAY
 
         print(
             f"[BatchJudge] mode={mode} | model={_gemini_model()}\n"
             f"  전체={len(payloads)} | 미설치={len(not_installed)} | "
             f"확정취약={len(certain)} | "
-            f"확정양호(배치)={len(confirmed_ok)}({n_ok_batches}배치) | "
+            f"확정양호(개별LLM)={len(confirmed_ok)} | "
             f"개별LLM={len(need_individual)}\n"
-            f"  MAX_CONCURRENT={MAX_CONCURRENT} BATCH_SIZE={BATCH_SIZE} "
+            f"  MAX_CONCURRENT={MAX_CONCURRENT} REQUEST_MIN_DELAY={REQUEST_MIN_DELAY}s "
             f"MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}\n"
             f"  예상≈{eta:.0f}초({eta/60:.1f}분)"
         )
@@ -785,33 +832,33 @@ class BatchJudge:
             results.append(r)
             print(f"  [확정취약] {p.item_code}({score}점)")
 
-        if not (confirmed_ok or need_individual) or not api_key:
-            if not api_key and (confirmed_ok or need_individual):
-                print("[BatchJudge] API KEY 없음 → 규칙 점수로 대체")
+        key = api_key or _get_api_key()
+
+        if not (confirmed_ok or need_individual) or not key:
+            if not key and (confirmed_ok or need_individual):
+                print("[BatchJudge] GEMINI_API_KEY 미설정 → 규칙 점수로 대체")
             for p in confirmed_ok + need_individual:
                 score, reason = rule_map[p.item_code]
                 results.append(_finalize(p, score, reason, {}, "rule_only"))
             _print_summary(results)
             return results
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=key)
+        print(f"[BatchJudge] AI Studio 모드 — model={_gemini_model()}")
         rule_scores_map = {c: s for c, (s, _) in rule_map.items()}
 
-        # ── 4단계: 확정 양호 → 배치 LLM (순차) ──────────────
+        # ── 4단계: 확정 양호 → 개별 LLM (1항목 1요청, AFC 비활성) ────────
         if confirmed_ok:
-            print(f"\n[배치LLM] {len(confirmed_ok)}건 ({n_ok_batches}배치)...")
-            for bi, bs in enumerate(range(0, len(confirmed_ok), BATCH_SIZE)):
-                batch = confirmed_ok[bs:bs + BATCH_SIZE]
-                codes = ",".join(p.item_code for p in batch)
-                label = f"배치{bi+1}/{n_ok_batches}[{codes}]"
+            print(f"\n[개별LLM-확정양호] {len(confirmed_ok)}건 (순차 처리)...")
+            for idx, p in enumerate(confirmed_ok, 1):
+                score, reason = rule_map[p.item_code]
+                label = f"확정양호{idx}/{len(confirmed_ok)}[{p.item_code}]"
                 print(f"  {label}")
-                batch_out = await _call_batch(client, batch, rule_scores_map, label)
-                for p, llm_d in zip(batch, batch_out):
-                    score, reason = rule_map[p.item_code]
-                    r = _finalize(p, score, reason, llm_d or {}, mode)
-                    results.append(r)
-                    vs = (llm_d or {}).get("vuln_score", "N/A")
-                    print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
+                llm_d = await _call_single_item(client, p, score, label)
+                r = _finalize(p, score, reason, llm_d or {}, mode)
+                results.append(r)
+                vs = (llm_d or {}).get("vuln_score", "N/A")
+                print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
 
         # ── 5단계: 불확실 → 개별 LLM (순차, MAX_CONCURRENT=1로 버스트 방지) ─
         if need_individual:
