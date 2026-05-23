@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block title %}{{ item.item_code }} {{ item.item_name }} — 주통기 스캐너{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_list') }}" class="text-info">스캔 목록</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_detail', scan_id=scan_id) }}" class="text-info">{{ scan_id }}</a></li>
+    <li class="breadcrumb-item active text-light">{{ item.item_code }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex align-items-start justify-content-between mb-3 gap-3">
+  <div>
+    <h5 class="mb-1 text-white">
+      <span class="text-info me-2">{{ item.item_code }}</span>{{ item.item_name }}
+    </h5>
+    <div class="d-flex gap-2 flex-wrap">
+      {% if item.result == '취약' %}
+        <span class="badge bg-danger fs-6"><i class="bi bi-exclamation-triangle me-1"></i>취약</span>
+      {% elif item.result == '개선' %}
+        <span class="badge bg-info text-dark fs-6">개선</span>
+      {% elif item.result == '해당없음' %}
+        <span class="badge bg-secondary fs-6">해당없음</span>
+      {% else %}
+        <span class="badge bg-success fs-6"><i class="bi bi-check-circle me-1"></i>양호</span>
+      {% endif %}
+      {% set sev = item.get('severity','') if item is mapping else item.severity if item.severity is defined else '' %}
+      {% if sev == '상' %}<span class="badge bg-danger">위험도 상</span>
+      {% elif sev == '중' %}<span class="badge bg-warning text-dark">위험도 중</span>
+      {% elif sev %}<span class="badge bg-secondary">위험도 {{ sev }}</span>{% endif %}
+      {% set cat = item.get('category','') if item is mapping else '' %}
+      {% if cat %}<span class="badge bg-dark border border-secondary text-light">{{ cat }}</span>{% endif %}
+    </div>
+  </div>
+  {% if item.result == '취약' %}
+  <a href="{{ url_for('patch_view', scan_id=scan_id, item_code=item.item_code) }}"
+     class="btn btn-warning text-dark flex-shrink-0">
+    <i class="bi bi-tools me-1"></i>패치 실행
+  </a>
+  {% endif %}
+</div>
+
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item"><a class="nav-link active text-light" data-bs-toggle="tab" href="#tab-result">판정 결과</a></li>
+  <li class="nav-item"><a class="nav-link text-light" data-bs-toggle="tab" href="#tab-guide">가이드라인</a></li>
+  {% if collected_data %}<li class="nav-item"><a class="nav-link text-light" data-bs-toggle="tab" href="#tab-collected">수집 데이터 <span class="badge bg-secondary">{{ collected_data|length }}</span></a></li>{% endif %}
+  {% if script_content %}<li class="nav-item"><a class="nav-link text-light" data-bs-toggle="tab" href="#tab-script">점검 스크립트</a></li>{% endif %}
+  {% if patch_history %}<li class="nav-item"><a class="nav-link text-light" data-bs-toggle="tab" href="#tab-history">패치 이력 <span class="badge bg-secondary">{{ patch_history|length }}</span></a></li>{% endif %}
+</ul>
+
+<div class="tab-content">
+  <!-- 판정 결과 -->
+  <div class="tab-pane fade show active" id="tab-result">
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-clipboard-check me-1 text-primary"></i>판정 근거</div>
+          <div class="card-body">
+            <p class="mb-0 text-light" style="white-space:pre-wrap">{{ item.reason or '판정 근거 없음' }}</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-header"><i class="bi bi-wrench me-1 text-warning"></i>조치 방법</div>
+          <div class="card-body">
+            <p class="mb-0 text-light small" style="white-space:pre-wrap">{{ item.remediation or (guide.remediation if guide else '') or '조치 방법 없음' }}</p>
+          </div>
+        </div>
+      </div>
+      {% if item.status_change and item.status_change not in ('유지','신규','없음') %}
+      <div class="col-12">
+        <div class="alert {% if item.status_change == '개선' %}alert-success{% else %}alert-danger{% endif %} mb-0">
+          <i class="bi {% if item.status_change == '개선' %}bi-arrow-up-circle{% else %}bi-arrow-down-circle{% endif %} me-2"></i>
+          이전 스캔 대비 <strong>{{ item.status_change }}</strong>
+          {% if item.previous_result %}<span class="text-muted ms-2">(이전: {{ item.previous_result }})</span>{% endif %}
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- 가이드라인 -->
+  <div class="tab-pane fade" id="tab-guide">
+    {% if guide %}
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-header text-light">판단 기준</div>
+          <div class="card-body">
+            <p class="text-light small mb-0" style="white-space:pre-wrap">{{ guide.standard or '—' }}</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card h-100">
+          <div class="card-header text-light">점검 방법</div>
+          <div class="card-body">
+            <p class="text-light small mb-0" style="white-space:pre-wrap">{{ guide.check_point or '—' }}</p>
+          </div>
+        </div>
+      </div>
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header text-light"><i class="bi bi-wrench text-warning me-1"></i>조치 방법 (주통기 가이드라인)</div>
+          <div class="card-body">
+            <p class="text-light small mb-0" style="white-space:pre-wrap">{{ guide.remediation or '—' }}</p>
+          </div>
+        </div>
+      </div>
+      {% if guide.content %}
+      <div class="col-12">
+        <div class="card">
+          <div class="card-header text-light">가이드라인 본문</div>
+          <div class="card-body">
+            <p class="text-light small mb-0" style="white-space:pre-wrap">{{ guide.content }}</p>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+      {% if guide.vuln_keywords or guide.ok_keywords %}
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header text-light small">취약 판정 키워드</div>
+          <div class="card-body">
+            {% for kw in (guide.vuln_keywords or '').split(',') if kw.strip() %}
+            <span class="badge bg-danger me-1 mb-1">{{ kw.strip() }}</span>
+            {% else %}<span class="text-muted small">—</span>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6">
+        <div class="card">
+          <div class="card-header text-light small">양호 판정 키워드</div>
+          <div class="card-body">
+            {% for kw in (guide.ok_keywords or '').split(',') if kw.strip() %}
+            <span class="badge bg-success me-1 mb-1">{{ kw.strip() }}</span>
+            {% else %}<span class="text-muted small">—</span>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    {% else %}
+    <p class="text-muted">가이드라인 정보 없음 (guidelines.db 확인 필요)</p>
+    {% endif %}
+  </div>
+
+  <!-- 수집 데이터 -->
+  {% if collected_data %}
+  <div class="tab-pane fade" id="tab-collected">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle small">
+        <thead class="table-dark">
+          <tr>
+            <th class="text-white" style="width:160px">점검 항목</th>
+            <th class="text-white" style="width:160px">대상 파일/설정</th>
+            <th class="text-white">수집된 값</th>
+            <th class="text-center text-white" style="width:110px">서비스 상태</th>
+            <th class="text-white" style="width:220px">실행 명령어</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in collected_data %}
+          <tr>
+            <td class="text-light">{{ c.sub_check }}</td>
+            <td class="text-muted font-monospace">{{ c.config_file or '—' }}</td>
+            <td>
+              <code class="d-block" style="white-space:pre-wrap;word-break:break-all;max-height:80px;overflow-y:auto">{{ c.collected_value or '(없음)' }}</code>
+            </td>
+            <td class="text-center">
+              {% set svc = c.service_status | upper %}
+              {% if svc == 'RUNNING' %}<span class="badge bg-success">RUNNING</span>
+              {% elif svc == 'NOT_RUNNING' %}<span class="badge bg-warning text-dark">NOT_RUNNING</span>
+              {% elif svc == 'NOT_INSTALLED' %}<span class="badge bg-secondary">NOT_INSTALLED</span>
+              {% else %}<span class="badge bg-dark border border-secondary text-light">{{ c.service_status }}</span>
+              {% endif %}
+            </td>
+            <td class="text-muted font-monospace" style="font-size:0.75rem;word-break:break-all">{{ c.source_command or '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- 점검 스크립트 -->
+  {% if script_content %}
+  <div class="tab-pane fade" id="tab-script">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-file-code me-1 text-success"></i>{{ item.item_code }} 점검 스크립트</span>
+        <button class="btn btn-sm btn-outline-secondary" onclick="copyScript()">
+          <i class="bi bi-clipboard me-1"></i>복사
+        </button>
+      </div>
+      <div class="card-body p-0">
+        <pre id="scriptContent" class="mb-0 p-3" style="background:#0d1117;color:#e6edf3;font-size:0.8rem;max-height:600px;overflow-y:auto;border-radius:0 0 8px 8px"><code>{{ script_content }}</code></pre>
+      </div>
+    </div>
+    <script>
+    function copyScript() {
+      navigator.clipboard.writeText(document.getElementById('scriptContent').innerText)
+        .then(() => { const btn = event.target.closest('button'); btn.innerHTML='<i class="bi bi-check me-1"></i>복사됨'; setTimeout(()=>{ btn.innerHTML='<i class="bi bi-clipboard me-1"></i>복사'; },2000); });
+    }
+    </script>
+  </div>
+  {% endif %}
+
+  <!-- 패치 이력 -->
+  {% if patch_history %}
+  <div class="tab-pane fade" id="tab-history">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead class="table-dark">
+          <tr>
+            <th class="text-white">일시</th>
+            <th class="text-center text-white">결과</th>
+            <th class="text-center text-white">시도</th>
+            <th class="text-white">출력 요약</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for h in patch_history %}
+          <tr>
+            <td class="text-light small">{{ h.patched_at[:19] if h.patched_at else '—' }}</td>
+            <td class="text-center">
+              {% if h.patch_success %}<span class="badge bg-success">성공</span>
+              {% else %}<span class="badge bg-danger">실패</span>{% endif %}
+            </td>
+            <td class="text-center text-light">{{ h.attempt }}</td>
+            <td class="text-light small">{{ (h.patch_stdout or '')[:100] }}{% if h.patch_stdout and h.patch_stdout|length > 100 %}…{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

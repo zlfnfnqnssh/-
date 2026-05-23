@@ -8,6 +8,7 @@ data/*.db
 
 # Python 캐시
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -37,7 +38,9 @@ _test_out/
 # 임시 파일
 *.tmp
 *.log
+*.bak
 scratch/
+.DS_Store
 
 # 테스트/임시 출력
 test_out.json
@@ -64,3 +67,21 @@ knowledge/data/uploads/*.pdf
 
 # Node
 node_modules/
+
+# Database files
+*.db
+db/*.db
+db/*.bak
+
+# syeon 브랜치 파일들
+riri_files/
+collectors/
+database/
+test_linuxparsing.py
+test_gemini.py
+find_models.py
+core/judge.py
+core/judge_and_patch.py
+core/patcher.py
+vulnerability.db
+db/guidelines.db.bak

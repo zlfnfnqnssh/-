@@ -1,0 +1,158 @@
+/* 주통기 취약점 스캐너 — 다크 테마 */
+
+:root {
+  /* 커스텀 색상 변수 */
+  --bg-base:    #0f172a;
+  --bg-card:    #1e293b;
+  --bg-dark:    #0f172a;
+  --border:     #334155;
+  --text-body:  #e2e8f0;
+  --text-muted: #94a3b8;
+
+  /* Bootstrap 5.3 다크 테마 CSS 변수 오버라이드
+     data-bs-theme="dark"와 함께 사용하여 모든 Bootstrap 컴포넌트에 적용 */
+  --bs-body-color:             #e2e8f0;
+  --bs-body-bg:                #0f172a;
+  --bs-secondary-color:        rgba(148, 163, 184, 0.75);
+  --bs-secondary-bg:           #1e293b;
+  --bs-tertiary-color:         rgba(148, 163, 184, 0.5);
+  --bs-tertiary-bg:            #0f172a;
+  --bs-emphasis-color:         #f8fafc;
+  --bs-border-color:           #334155;
+  --bs-border-color-translucent: rgba(51, 65, 85, 0.9);
+  --bs-link-color:             #38bdf8;
+  --bs-link-hover-color:       #7dd3fc;
+  --bs-link-color-rgb:         56, 189, 248;
+  --bs-link-hover-color-rgb:   125, 211, 252;
+  --bs-heading-color:          #f1f5f9;
+  --bs-card-bg:                #1e293b;
+  --bs-card-border-color:      #334155;
+  --bs-card-cap-bg:            #1e293b;
+  --bs-table-color:            #e2e8f0;
+  --bs-table-bg:               transparent;
+  --bs-table-border-color:     #1e2d40;
+  --bs-input-color:            #e2e8f0;
+  --bs-input-bg:               #0f172a;
+  --bs-input-border-color:     #334155;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-body);
+  font-size: 0.92rem;
+}
+
+/* ── 텍스트 기본 강제 ─────────────── */
+p, li, td, th, label, span, div {
+  /* 인라인 컬러가 없는 요소는 밝게 */
+}
+.text-white     { color: #f1f5f9 !important; }
+.text-light     { color: #cbd5e1 !important; }
+.text-muted     { color: #94a3b8 !important; }
+.text-secondary { color: #94a3b8 !important; }
+
+/* ── 네비게이션 ─────────────────── */
+.navbar { border-bottom: 1px solid var(--border); }
+.active-nav { color: #38bdf8 !important; font-weight: 600; }
+
+/* ── 카드 ────────────────────────── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border) !important;
+  border-radius: 8px;
+  color: var(--text-body);
+}
+.card-header {
+  border-bottom: 1px solid var(--border);
+  padding: 0.6rem 1rem;
+  font-size: 0.9rem;
+  color: #e2e8f0;
+  background: var(--bg-card);
+}
+.card-body { color: var(--text-body); }
+.card-footer {
+  border-top: 1px solid var(--border);
+  padding: 0.6rem 1rem;
+  background: var(--bg-card);
+}
+
+/* ── 통계 카드 ───────────────────── */
+.stat-card { background: var(--bg-card); border-radius: 10px; transition: transform .15s; }
+.stat-card:hover { transform: translateY(-2px); }
+.stat-icon { font-size: 2rem; margin-bottom: .25rem; }
+.stat-num  { font-size: 2.4rem; font-weight: 700; line-height: 1; }
+.stat-label { font-size: .75rem; color: var(--text-muted); margin-top: .25rem; }
+
+/* ── 테이블 ──────────────────────── */
+.table { color: var(--text-body) !important; }
+.table-dark { background: #0f172a !important; }
+.table thead th { color: #f1f5f9 !important; }
+.table tbody td { color: #e2e8f0; }
+.table-hover tbody tr:hover { background: #263352 !important; color: #f1f5f9 !important; }
+.table td, .table th { border-color: #1e2d40 !important; padding: 0.6rem 0.9rem; vertical-align: middle; }
+
+/* ── 탭 ──────────────────────────── */
+.nav-tabs { border-bottom: 1px solid var(--border); }
+.nav-tabs .nav-link { color: #94a3b8 !important; border: none; padding: .5rem 1rem; border-radius: 0; }
+.nav-tabs .nav-link:hover { color: #e2e8f0 !important; background: #1e293b; }
+.nav-tabs .nav-link.active { color: #38bdf8 !important; background: transparent; border-bottom: 2px solid #38bdf8; font-weight: 600; }
+
+/* ── 코드 ────────────────────────── */
+code { color: #67e8f9; background: rgba(103,232,249,.1); padding: .1em .35em; border-radius: 4px; }
+.font-monospace { font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace !important; }
+
+/* ── 알림 ────────────────────────── */
+.alert { border-radius: 8px; }
+.alert-danger  { background: rgba(239,68,68,.12);  border-color: rgba(239,68,68,.3);  color: #fca5a5 !important; }
+.alert-success { background: rgba(34,197,94,.1);   border-color: rgba(34,197,94,.3);  color: #86efac !important; }
+.alert-warning { background: rgba(234,179,8,.1);   border-color: rgba(234,179,8,.3);  color: #fde68a !important; }
+.alert-info    { background: rgba(14,165,233,.1);  border-color: rgba(14,165,233,.3); color: #7dd3fc !important; }
+
+/* ── 프로그레스 ──────────────────── */
+.progress { background: #1e293b; border-radius: 6px; }
+
+/* ── 브레드크럼 ──────────────────── */
+.breadcrumb { background: transparent; padding: 0; margin-bottom: .25rem; }
+.breadcrumb-item a { color: #38bdf8; text-decoration: none; }
+.breadcrumb-item.active { color: #94a3b8; }
+.breadcrumb-item + .breadcrumb-item::before { color: #475569; }
+
+/* ── 판정 근거 셀 ────────────────── */
+.reason-cell { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 스크립트 에디터 ─────────────── */
+#scriptEditor {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  line-height: 1.6;
+  tab-size: 4;
+  color: #4ade80 !important;
+  background: #000 !important;
+}
+#scriptEditor:focus { box-shadow: none; outline: 1px solid #334155; }
+
+/* ── 로그 영역 ───────────────────── */
+#logArea { line-height: 1.7; color: #e2e8f0; }
+
+/* ── 모달 ────────────────────────── */
+.modal-content { background: var(--bg-card); color: var(--text-body); }
+.modal-header { color: #f1f5f9; }
+.modal-body { color: #e2e8f0; }
+
+/* ── 폼 ──────────────────────────── */
+.form-control { background: #0f172a !important; border-color: #334155 !important; color: #e2e8f0 !important; }
+.form-control::placeholder { color: #64748b !important; }
+.form-control:focus { box-shadow: 0 0 0 2px rgba(56,189,248,.3) !important; border-color: #38bdf8 !important; }
+.input-group-text { background: #1e293b !important; border-color: #334155 !important; color: #94a3b8 !important; }
+
+/* ── 스크롤바 ────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0f172a; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+
+/* ── pre-wrap 텍스트 ─────────────── */
+[style*="white-space:pre-wrap"] { word-break: break-word; }
+
+@media (max-width: 768px) {
+  .stat-num { font-size: 1.8rem; }
+  .container-fluid { padding-left: 1rem; padding-right: 1rem; }
+}

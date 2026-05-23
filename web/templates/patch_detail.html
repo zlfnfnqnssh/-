@@ -1,0 +1,245 @@
+{% extends "base.html" %}
+{% block title %}패치 — {{ item_code }} — 주통기 스캐너{% endblock %}
+
+{% block content %}
+<!-- 브레드크럼 -->
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_list') }}">스캔 목록</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_detail', scan_id=scan_id) }}">{{ scan_id }}</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('item_detail', scan_id=scan_id, item_code=item_code) }}">{{ item_code }}</a></li>
+    <li class="breadcrumb-item active">패치</li>
+  </ol>
+</nav>
+
+<h5 class="mb-1">
+  <i class="bi bi-tools text-warning me-2"></i>패치 실행 — {{ item_code }}
+  {% if item %}<span class="text-muted fw-normal">{{ item.item_name }}</span>{% endif %}
+</h5>
+<p class="text-muted small mb-3">패치 스크립트를 확인하고 실행하세요. 오류 발생 시 Gemini가 자동으로 수정을 시도합니다 (최대 3회).</p>
+
+<!-- Before 상태 -->
+<div class="alert {% if before_result.result == '취약' %}alert-danger{% else %}alert-success{% endif %} d-flex align-items-center gap-2 mb-3">
+  <i class="bi bi-info-circle-fill fs-5"></i>
+  <div>
+    <strong>현재 상태:</strong>
+    <span class="badge {% if before_result.result == '취약' %}bg-danger{% else %}bg-success{% endif %} ms-1">{{ before_result.result }}</span>
+    {% if before_result.reason %}
+    <span class="text-muted small ms-2">{{ before_result.reason[:100] }}{% if before_result.reason|length > 100 %}…{% endif %}</span>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-3">
+  <!-- 스크립트 편집기 -->
+  <div class="col-lg-7">
+    <div class="card border-0">
+      <div class="card-header bg-dark border-secondary d-flex align-items-center justify-content-between">
+        <span><i class="bi bi-code-square me-1 text-success"></i>패치 스크립트</span>
+        <button class="btn btn-sm btn-outline-secondary" onclick="copyScript()">
+          <i class="bi bi-clipboard me-1"></i>복사
+        </button>
+      </div>
+      <div class="card-body p-0">
+        <form id="patchForm">
+          <textarea id="scriptEditor" name="script"
+                    class="form-control bg-black text-success border-0 font-monospace"
+                    style="min-height:380px;font-size:0.82rem;resize:vertical"
+                    spellcheck="false">{{ patch_script }}</textarea>
+        </form>
+      </div>
+      <div class="card-footer bg-dark border-secondary">
+        <button id="btnExecute" class="btn btn-warning text-dark fw-bold"
+                onclick="executeScript()">
+          <i class="bi bi-play-fill me-1"></i>패치 실행
+        </button>
+        <small class="text-muted ms-2">스크립트 편집 후 실행 가능합니다</small>
+      </div>
+    </div>
+  </div>
+
+  <!-- 실행 로그 + After -->
+  <div class="col-lg-5">
+    <!-- 실행 로그 -->
+    <div class="card border-0 mb-3">
+      <div class="card-header bg-dark border-secondary d-flex align-items-center justify-content-between">
+        <span><i class="bi bi-terminal me-1 text-primary"></i>실행 로그</span>
+        <span id="statusBadge" class="badge bg-secondary">대기 중</span>
+      </div>
+      <div class="card-body p-0">
+        <div id="logArea"
+             class="bg-black text-light font-monospace p-3 overflow-auto"
+             style="min-height:200px;max-height:340px;font-size:0.78rem;white-space:pre-wrap">
+          <span class="text-muted">실행 버튼을 누르면 여기에 로그가 출력됩니다.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Before / After 비교 -->
+    <div class="card border-0" id="compareCard" style="display:none">
+      <div class="card-header bg-dark border-secondary">
+        <i class="bi bi-arrow-left-right me-1 text-info"></i>전후 비교
+      </div>
+      <div class="card-body p-2">
+        <div class="row g-2 text-center">
+          <div class="col-6">
+            <div class="p-2 rounded bg-dark border border-secondary">
+              <div class="small text-muted mb-1">패치 전</div>
+              <span id="beforeBadge" class="badge bg-danger fs-6">{{ before_result.result }}</span>
+            </div>
+          </div>
+          <div class="col-6">
+            <div class="p-2 rounded bg-dark border border-secondary">
+              <div class="small text-muted mb-1">패치 후</div>
+              <span id="afterBadge" class="badge bg-secondary fs-6">—</span>
+            </div>
+          </div>
+        </div>
+        <div id="compareReason" class="mt-2 small text-muted"></div>
+      </div>
+      <div class="card-footer bg-dark border-secondary">
+        <button class="btn btn-sm btn-info text-dark" onclick="runRecheck()">
+          <i class="bi bi-arrow-repeat me-1"></i>재점검 실행
+        </button>
+        <small class="text-muted ms-1">패치 성공 후 실행하세요</small>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SCAN_ID   = "{{ scan_id }}";
+const ITEM_CODE = "{{ item_code }}";
+let patchId = null;
+let evtSource = null;
+
+function copyScript() {
+  const txt = document.getElementById('scriptEditor').value;
+  navigator.clipboard.writeText(txt).then(() => {
+    const btn = event.target.closest('button');
+    btn.innerHTML = '<i class="bi bi-check me-1"></i>복사됨';
+    setTimeout(() => { btn.innerHTML = '<i class="bi bi-clipboard me-1"></i>복사'; }, 1500);
+  });
+}
+
+function setStatus(text, cls) {
+  const b = document.getElementById('statusBadge');
+  b.textContent = text;
+  b.className = `badge bg-${cls}`;
+}
+
+function appendLog(msg, cls = '') {
+  const area = document.getElementById('logArea');
+  const line = document.createElement('div');
+  line.className = cls;
+  line.textContent = msg;
+  area.appendChild(line);
+  area.scrollTop = area.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('logArea').innerHTML = '';
+}
+
+async function executeScript() {
+  const script = document.getElementById('scriptEditor').value.trim();
+  if (!script) { alert('스크립트가 비어 있습니다.'); return; }
+
+  clearLog();
+  setStatus('실행 중…', 'warning');
+  document.getElementById('btnExecute').disabled = true;
+  document.getElementById('compareCard').style.display = 'none';
+
+  const formData = new FormData();
+  formData.append('script', script);
+
+  const resp = await fetch(`/patch/execute/${SCAN_ID}/${ITEM_CODE}`, {
+    method: 'POST', body: formData
+  });
+  if (!resp.ok) {
+    appendLog('[오류] 실행 요청 실패', 'text-danger');
+    setStatus('오류', 'danger');
+    document.getElementById('btnExecute').disabled = false;
+    return;
+  }
+  const data = await resp.json();
+  patchId = data.patch_id;
+  startStream(patchId);
+}
+
+function startStream(pid) {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(`/patch/stream/${pid}`);
+
+  evtSource.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'line') {
+      let cls = '';
+      if (d.msg.startsWith('✓')) cls = 'text-success';
+      else if (d.msg.startsWith('✗') || d.msg.startsWith('⚠')) cls = 'text-danger';
+      else if (d.msg.startsWith('⏳') || d.msg.startsWith('✎')) cls = 'text-warning';
+      else if (d.msg.startsWith('═')) cls = 'text-info';
+      appendLog(d.msg, cls);
+    } else if (d.type === 'status') {
+      const s = d.status;
+      if (s.startsWith('attempt:')) setStatus(`시도 ${s.split(':')[1]}`, 'warning');
+      else if (s.startsWith('fixing:')) setStatus('Gemini 수정 중…', 'info');
+      else if (s === 'success') { setStatus('성공', 'success'); onSuccess(); }
+      else if (s === 'failed') { setStatus('실패', 'danger'); onFailed(); }
+    } else if (d.type === 'done') {
+      evtSource.close();
+      document.getElementById('btnExecute').disabled = false;
+      document.getElementById('compareCard').style.display = '';
+    } else if (d.type === 'ping') {
+      /* keep-alive, ignore */
+    }
+  };
+
+  evtSource.onerror = () => {
+    appendLog('[SSE 연결 종료]', 'text-secondary');
+    evtSource.close();
+    document.getElementById('btnExecute').disabled = false;
+  };
+}
+
+function onSuccess() {
+  document.getElementById('compareCard').style.display = '';
+}
+function onFailed() {
+  document.getElementById('compareCard').style.display = '';
+}
+
+async function runRecheck() {
+  const btn = event.target.closest('button');
+  btn.disabled = true;
+  btn.innerHTML = '<i class="bi bi-hourglass-split me-1"></i>재점검 중…';
+
+  try {
+    const resp = await fetch(`/patch/recheck/${SCAN_ID}/${ITEM_CODE}`);
+    const d = await resp.json();
+
+    const afterBadge = document.getElementById('afterBadge');
+    afterBadge.textContent = d.after.result || '확인 실패';
+    if (d.improved) {
+      afterBadge.className = 'badge bg-success fs-6';
+      document.getElementById('compareReason').innerHTML =
+        '<i class="bi bi-check-circle text-success me-1"></i><strong class="text-success">패치 성공!</strong> 취약 → 양호로 개선되었습니다.';
+    } else if (d.after.result && d.after.result.includes('취약')) {
+      afterBadge.className = 'badge bg-danger fs-6';
+      document.getElementById('compareReason').innerHTML =
+        '<i class="bi bi-exclamation-circle text-danger me-1"></i>아직 취약 상태입니다. 추가 조치가 필요합니다.';
+    } else {
+      afterBadge.className = 'badge bg-warning text-dark fs-6';
+      document.getElementById('compareReason').textContent = d.after.data || '결과 확인 필요';
+    }
+  } catch (err) {
+    document.getElementById('compareReason').textContent = '재점검 실패: ' + err.message;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>재점검 실행';
+  }
+}
+</script>
+{% endblock %}
