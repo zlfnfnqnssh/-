@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ from runner import ScriptRunner  # mcp_server/runner.py
 # ── 환경변수 기반 설정 ─────────────────────────────────────────
 DEFAULT_DSN        = os.getenv("JUTONGGI_DB_DSN",    "postgresql://admin:admin123@localhost:5432/jtk_db")
 DEFAULT_REPO_ROOT  = Path(os.getenv("JUTONGGI_REPO_ROOT", ".")).resolve()
-DEFAULT_GEMINI_CMD = os.getenv("GEMINI_CLI_CMD",     "gemini")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 mcp = FastMCP("jutonggi-mcp")
 
@@ -27,7 +29,6 @@ def _runner(dsn: str | None = None) -> ScriptRunner:
     return ScriptRunner(
         dsn=dsn or DEFAULT_DSN,
         repo_root=DEFAULT_REPO_ROOT,
-        gemini_cli_cmd=DEFAULT_GEMINI_CMD,
     )
 
 
@@ -49,17 +50,21 @@ def list_missing_scripts(
     import psycopg
     from psycopg.rows import dict_row
 
-    scripts_root = DEFAULT_REPO_ROOT / "scripts" / os_type
+    runner = _runner(dsn)
+    normalized_os = _normalize_os_type(os_type)
 
     conditions: list[str] = []
     params: list[str] = []
     if prefix:
         conditions.append("prefix = %s")
         params.append(prefix)
+    elif normalized_os:
+        conditions.append("LOWER(os_type) = %s")
+        params.append(normalized_os)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     sql = f"""
-        SELECT code, title, severity, category,
+        SELECT code, prefix, os_type, title, severity, category,
                criteria_good, criteria_bad,
                action, action_impact, check_content
         FROM vulnerabilities
@@ -74,12 +79,12 @@ def list_missing_scripts(
 
     missing = [
         dict(r) for r in rows
-        if not (scripts_root / f"{r['code']}.py").exists()
+        if not runner.resolve_script_path(r["code"], target_os=r.get("os_type") or normalized_os).exists()
     ]
 
     return {
         "count":   len(missing),
-        "os_type": os_type,
+        "os_type": normalized_os or os_type,
         "items":   missing,
         "codes":   [r["code"] for r in missing],
     }
@@ -89,9 +94,11 @@ def list_missing_scripts(
 @mcp.tool()
 def generate_check_script(
     code:      str,
-    target_os: str = "windows",
+    target_os: str = "",
     overwrite: bool = False,
     dsn:       str | None = None,
+    gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
 ) -> dict[str, Any]:
     """
     주통기 DB 가이드라인을 기반으로 점검 스크립트를 자동 생성합니다.
@@ -99,7 +106,7 @@ def generate_check_script(
     문법 검사 + 실행 검증까지 수행합니다.
 
     - code:      점검 코드 (예: PC-03, U-01)
-    - target_os: windows / linux
+    - target_os: windows / linux (빈 값이면 DB의 os_type 또는 코드 prefix로 자동 결정)
     - overwrite: 기존 스크립트 덮어쓰기 여부 (기본값: False)
     """
     runner = _runner(dsn)
@@ -108,6 +115,7 @@ def generate_check_script(
     vuln = runner.get_vulnerability(code)
     if not vuln:
         return {"generated": False, "reason": f"DB에 {code} 항목 없음"}
+    target_os = _normalize_os_type(target_os) or _normalize_os_type(vuln.get("os_type")) or "windows"
 
     script_path = runner.resolve_script_path(code, target_os=target_os)
     script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,26 +129,24 @@ def generate_check_script(
             "reason":      "already_exists",
         }
 
-    # 프롬프트 구성 + Gemini CLI 호출
+    # 프롬프트 구성 + Gemini API 호출
     prompt = _build_generation_prompt(vuln, script_path, target_os)
-    proc = subprocess.run(
-        [runner.gemini_cli_cmd, "-p", prompt],
-        capture_output=True,
-        text=True,
-        cwd=str(DEFAULT_REPO_ROOT),
-        check=False,
-    )
-
-    if proc.returncode != 0:
+    try:
+        gemini_output = _call_gemini_api(
+            prompt,
+            api_key=gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
+            model=gemini_model or DEFAULT_GEMINI_MODEL,
+        )
+    except RuntimeError as exc:
         return {
             "code":      code,
             "generated": False,
-            "reason":    "gemini_cli_error",
-            "error":     proc.stderr.strip(),
+            "reason":    "gemini_api_error",
+            "error":     str(exc),
         }
 
     # 코드 블록 추출 후 저장
-    code_text = _extract_python_code(proc.stdout)
+    code_text = _extract_python_code(gemini_output)
     script_path.write_text(code_text, encoding="utf-8")
 
     # ── 검증 1: 문법 검사 ────────────────────────────────────
@@ -203,7 +209,49 @@ def generate_check_script(
         "script_path":   str(script_path),
         "generated":     True,
         "validated":     True,
+        "gemini_model":   gemini_model or DEFAULT_GEMINI_MODEL,
         "sample_output": sample_output,
+    }
+
+
+@mcp.tool()
+def generate_missing_scripts(
+    prefix:         str = "",
+    os_type:        str = "windows",
+    overwrite:      bool = False,
+    max_items:      int = 20,
+    dsn:            str | None = None,
+    gemini_api_key: str | None = None,
+    gemini_model:   str | None = None,
+) -> dict[str, Any]:
+    """
+    DB에는 있지만 scripts/{windows,linux}/ 에 없는 점검 스크립트를 일괄 생성합니다.
+    내부적으로 generate_check_script와 동일하게 Gemini API로 생성하고 검증합니다.
+    """
+    missing = list_missing_scripts(prefix=prefix, os_type=os_type, dsn=dsn)
+    items = missing["items"][:max(0, max_items)]
+    results: list[dict[str, Any]] = []
+
+    for item in items:
+        result = generate_check_script(
+            code=item["code"],
+            target_os=item.get("os_type") or os_type,
+            overwrite=overwrite,
+            dsn=dsn,
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
+        )
+        results.append(result)
+
+    generated = [r for r in results if r.get("generated")]
+    failed = [r for r in results if not r.get("generated")]
+    return {
+        "requested": len(items),
+        "missing_total": missing["count"],
+        "generated_count": len(generated),
+        "failed_count": len(failed),
+        "results": results,
+        "remaining_codes": missing["codes"][len(items):],
     }
 
 
@@ -293,6 +341,64 @@ if __name__ == "__main__":
 """
 
 
+def _normalize_os_type(os_type: str | None) -> str:
+    if not os_type:
+        return ""
+    lowered = os_type.strip().lower()
+    if lowered in {"all", "*"}:
+        return ""
+    if lowered.startswith("win"):
+        return "windows"
+    if lowered.startswith("lin"):
+        return "linux"
+    return lowered
+
+
+def _call_gemini_api(prompt: str, api_key: str, model: str) -> str:
+    """Gemini REST API를 호출해 생성 텍스트를 반환합니다."""
+    if not api_key or api_key == "YOUR_GEMINI_KEY_HERE":
+        raise RuntimeError("GEMINI_API_KEY 환경변수 또는 gemini_api_key 인자가 필요합니다.")
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 4096,
+        },
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gemini API 연결 실패: {exc}") from exc
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini API 응답에 candidates가 없습니다: {data}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(part.get("text", "") for part in parts).strip()
+    if not text:
+        raise RuntimeError(f"Gemini API 응답에 생성 텍스트가 없습니다: {data}")
+    return text
+
+
 def _extract_python_code(raw: str) -> str:
     """Gemini 응답에서 Python 코드 블록 추출"""
     text = raw.strip()
@@ -313,3 +419,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

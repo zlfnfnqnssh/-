@@ -4,6 +4,8 @@ import json
 import os
 import platform
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,7 @@ class ScriptRunResult:
 
 
 class ScriptRunner:
-    """Run and manage jutonggi check scripts with OS routing and Gemini fallback."""
+    """Run and manage jutonggi check scripts with OS routing and Gemini generation."""
 
     def __init__(
         self,
@@ -36,7 +38,7 @@ class ScriptRunner:
         self.dsn = dsn
         self.repo_root = Path(repo_root).resolve()
         self.scripts_root = self.repo_root / "scripts"
-        self.gemini_cli_cmd = gemini_cli_cmd or os.getenv("GEMINI_CLI_CMD", "gemini")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     def get_vulnerability(self, code: str) -> dict[str, Any] | None:
         sql = """
@@ -100,6 +102,8 @@ class ScriptRunner:
         code: str,
         target_os: str | None = None,
         overwrite: bool = False,
+        gemini_api_key: str | None = None,
+        gemini_model: str | None = None,
     ) -> dict[str, Any]:
         vuln = self.get_vulnerability(code)
         if not vuln:
@@ -117,26 +121,20 @@ class ScriptRunner:
             }
 
         prompt = self._build_gemini_prompt(vuln, script_path)
-        cli_cmd = [self.gemini_cli_cmd, "-p", prompt]
-        proc = subprocess.run(
-            cli_cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(self.repo_root),
-            check=False,
+        code_block = self._extract_python_code(
+            self._call_gemini_api(
+                prompt,
+                api_key=gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
+                model=gemini_model or self.gemini_model,
+            )
         )
-
-        if proc.returncode != 0:
-            raise RuntimeError(f"Gemini CLI failed({proc.returncode}): {proc.stderr.strip()}")
-
-        code_block = self._extract_python_code(proc.stdout)
         script_path.write_text(code_block, encoding="utf-8")
 
         return {
             "code": code,
             "script_path": str(script_path),
             "generated": True,
-            "gemini_cmd": " ".join(cli_cmd),
+            "gemini_model": gemini_model or self.gemini_model,
         }
 
     def _folder_for_prefix(self, prefix: str, target_os: str | None) -> str:
@@ -181,3 +179,38 @@ class ScriptRunner:
                 lines = lines[:-1]
             return "\n".join(lines).strip() + "\n"
         return text + ("\n" if not text.endswith("\n") else "")
+
+    @staticmethod
+    def _call_gemini_api(prompt: str, api_key: str, model: str) -> str:
+        if not api_key or api_key == "YOUR_GEMINI_KEY_HERE":
+            raise RuntimeError("GEMINI_API_KEY environment variable or gemini_api_key argument is required.")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Gemini API connection failed: {exc}") from exc
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini API response has no candidates: {data}")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts).strip()
+        if not text:
+            raise RuntimeError(f"Gemini API response has no generated text: {data}")
+        return text
+

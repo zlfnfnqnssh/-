@@ -21,6 +21,7 @@ class SubCheckResult:
     raw_output: str
     service_status: str
     source_command: str
+    script_result: str = ""  # 점검 스크립트가 직접 판정한 결과 (양호/취약/규칙불가)
 
 
 @dataclass
@@ -45,6 +46,8 @@ class ScanResult:
         if "item_code" in d and "items" not in d:
             valid_fields = set(SubCheckResult.__dataclass_fields__.keys())
             sub_checks = d.get("sub_checks", [])
+            # 스크립트 최상위 result 필드 (양호/취약/규칙불가) — 규칙 엔진 우선 신호
+            top_result = d.get("result", "")
             if not sub_checks:
                 # sub_checks 없는 단순 flat 포맷 (U-19 이후 서비스 관리 항목 등)
                 # → 최상위 collected_value/raw_output/source_command 로 단일 SubCheckResult 생성
@@ -64,7 +67,13 @@ class ScanResult:
                     "raw_output":      d.get("raw_output", ""),
                     "service_status":  svc_status,
                     "source_command":  d.get("source_command", ""),
+                    "script_result":   top_result,
                 }]
+            else:
+                # sub_checks가 있는 경우 첫 번째 항목에 script_result 전파
+                for sc in sub_checks:
+                    if "script_result" not in sc:
+                        sc["script_result"] = top_result
             d = {
                 "scan_id":    d.get("scan_id", ""),
                 "scan_date":  d.get("scan_date", ""),
@@ -76,7 +85,8 @@ class ScanResult:
                     "item_name":     d.get("item_name", ""),
                     "check_results": [
                         dict({k: v for k, v in sc.items() if k in valid_fields},
-                             service_status=sc.get("service_status", "N/A"))
+                             service_status=sc.get("service_status", "N/A"),
+                             script_result=sc.get("script_result", ""))
                         for sc in sub_checks
                     ],
                 }],

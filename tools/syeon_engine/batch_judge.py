@@ -1,20 +1,24 @@
 """
-batch_judge.py  (v9)
---------------------
+batch_judge.py  (v10)
+---------------------
 규칙/LLM 하이브리드 판정 엔진.
 
-변경사항 (v9):
-  1. Vertex AI 코드 완전 제거 — AI Studio(유료) 단일 백엔드
-  2. gemini-2.5-flash + thinking_budget=0 — 비용 제어 (thinking 활성 시 15× 비싸짐)
-  3. 유료 AI Studio 기준 rate limit 완화 (1000 RPM → delay 3초, 20 RPM 운용)
-  4. 예상 비용: 72항목 × ~800토큰 ≈ 23 KRW per run
+변경사항 (v10):
+  1. 규칙 엔진 우선순위 재설계: 스크립트 직접 판정 → 서비스 상태 → 패턴 매칭
+  2. script_result(양호/취약/규칙불가) 를 models.py에서 받아 최우선 신호로 사용
+  3. LLM 역할 분리: 취약/양호 확정 항목은 reason/remediation 생성에만 사용
+  4. 규칙불가 항목: LLM이 전권 판정
+  5. 점수 혼합(0.3/0.7) 제거 — 스크립트 판정 결과 뒤집기 불가 (할루시네이션 차단)
+  6. reason/remediation: 5문장, 사용자 친화적, 점수 표기 없음
 
 흐름:
-  1단계 규칙 엔진 → 분류
-    ├─ 전체 미설치              → 즉시 해당없음 (LLM 없음)
-    ├─ 규칙 확정 취약 (≥85)    → 즉시 취약 (LLM 없음)
-    ├─ 규칙 확정 양호 (conclusive, <70) → 개별 LLM (1항목 1요청)
-    └─ 불확실                   → 개별 LLM (1항목 1요청)
+  1단계 규칙 엔진 → 6개 버킷 분류
+    ├─ NOT_INSTALLED                    → 즉시 해당없음 (LLM 없음)
+    ├─ 서비스 전체 비활성(NOT_RUNNING) → 즉시 양호 (LLM 없음)
+    ├─ script=취약 (확정)              → LLM: reason/remediation 생성 (결과 고정=취약)
+    ├─ script=양호 (확정)              → LLM: reason/remediation 생성 (결과 고정=양호)
+    ├─ script=규칙불가                 → LLM: 전권 판정
+    └─ 패턴매칭 불확실                 → LLM: 전권 판정
 
 서비스 상태값:
   RUNNING / NOT_RUNNING / NOT_INSTALLED / INSTALLED / N/A
@@ -232,31 +236,60 @@ _SAFE_CONFIG_WORDS = [
 # 규칙 엔진
 # ──────────────────────────────────────────────────────────
 
-def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
+def _get_script_result(checks) -> str:
+    """check_results에서 스크립트 직접 판정 결과를 추출 (가장 먼저 발견된 비어있지 않은 값)."""
+    for c in checks:
+        sr = getattr(c, "script_result", "").strip()
+        if sr:
+            return sr
+    return ""
+
+
+def _rule_score(payload: JudgePayload) -> tuple[int, str, bool, str]:
     """
-    반환: (score 0~100, reason, is_conclusive)
+    반환: (score 0~100, reason, is_conclusive, script_result)
     score == -1 → 전체 미설치 (해당없음 마커)
+
+    우선순위:
+      P1. script_result == 규칙불가  → (50, ..., False, "규칙불가")  — LLM 전권
+      P2. 전체 NOT_INSTALLED         → (-1, ..., True,  ...)          — 해당없음 즉시
+      P3. 서비스 전체 비활성         → (0,  ..., True,  ...)          — 양호 즉시
+      P4. script_result == 취약      → (90, ..., True,  "취약")       — LLM text only
+      P5. script_result == 양호      → (10, ..., True,  "양호")       — LLM text only
+      P6. 패턴 매칭                  → (계산값, ..., False, ...)       — LLM hybrid
     """
     checks = payload.check_results
     code   = payload.item_code
     vkws   = _DB.vuln_kw(code)
     okws   = _DB.ok_kw(code)
 
-    # ── 전역 확정: 전체 미설치 ─────────────────────────────
+    script_result = _get_script_result(checks)
+
+    # P1: 규칙불가 → LLM 전권
+    if script_result == "규칙불가":
+        return 50, "스크립트 자동 판정 불가 — LLM 판정 필요", False, script_result
+
+    # P2: 전체 NOT_INSTALLED → 해당없음
     if checks and all(c.service_status.upper() == "NOT_INSTALLED" for c in checks):
-        return -1, "전체 서비스/패키지 미설치", True
+        return -1, "전체 서비스/패키지 미설치", True, script_result
 
-    # ── 전역 확정: 서비스 체크 전체 비활성+파일없음 ────────
+    # P3: 서비스 점검 항목 전체 비활성 → 양호 (서비스 없으면 위협 없음)
     svc_checks = [c for c in checks if c.service_status.upper() != "N/A"]
-    if svc_checks:
-        all_absent = all(
-            c.service_status.upper() in ("NOT_INSTALLED", "NOT_RUNNING")
-            and any(pat in c.collected_value.lower() for pat in _ABSENT_PATTERNS)
-            for c in svc_checks
-        )
-        if all_absent:
-            return 0, "관련 서비스 비활성 및 대상 파일 없음", True
+    if svc_checks and all(
+        c.service_status.upper() in ("NOT_INSTALLED", "NOT_RUNNING")
+        for c in svc_checks
+    ):
+        return 0, "관련 서비스 전체 비활성 — 현재 위협 없음", True, script_result
 
+    # P4: 스크립트 직접 판정 취약 → 결과 고정 (score=90, conclusive)
+    if script_result == "취약":
+        return 90, "점검 스크립트 직접 판정: 취약", True, script_result
+
+    # P5: 스크립트 직접 판정 양호 → 결과 고정 (score=10, conclusive)
+    if script_result == "양호":
+        return 10, "점검 스크립트 직접 판정: 양호", True, script_result
+
+    # P6: 패턴 매칭 (스크립트 결과 없거나 불명확할 때)
     total, reasons = 0, []
 
     for c in checks:
@@ -265,76 +298,72 @@ def _rule_score(payload: JudgePayload) -> tuple[int, str, bool]:
         svc  = c.service_status.upper()
         sub  = c.sub_check[:18]
 
-        # Step 1: 서비스 상태
+        # 서비스 상태
         if svc == "NOT_INSTALLED":
-            total -= 25; reasons.append(f"{sub}:미설치(-25)"); continue
+            total -= 25; reasons.append(f"{sub}:미설치"); continue
         if svc == "NOT_RUNNING":
-            total -= 25; reasons.append(f"{sub}:미실행(-25)")
+            total -= 25; reasons.append(f"{sub}:비실행"); continue
         elif svc == "RUNNING":
-            total += 10; reasons.append(f"{sub}:실행중(+10)")
+            total += 15; reasons.append(f"{sub}:실행중")
         elif svc == "INSTALLED":
-            total += 5;  reasons.append(f"{sub}:설치됨(+5)")
+            total += 5;  reasons.append(f"{sub}:설치됨")
 
-        # Step 2: 파일/설정 없음
+        # 파일/설정 없음
         if any(pat in comb for pat in _ABSENT_PATTERNS + ["권한 없음"]):
-            if svc in ("NOT_RUNNING", "NOT_INSTALLED"):
-                reasons.append(f"{sub}:서비스없음→파일없음(무시)")
-            else:
-                total += 15; reasons.append(f"{sub}:파일/설정없음(+15)")
-            continue
+            total += 12; reasons.append(f"{sub}:파일없음"); continue
 
-        # Step 3: nouser/nogroup
+        # nouser/nogroup (소유자 미설정 파일)
         if re.search(r'\bnouser\b|\bnogroup\b', comb):
-            total += 10; reasons.append(f"{sub}:nouser/nogroup(+10)")
+            total += 15; reasons.append(f"{sub}:nouser/nogroup")
 
-        # Step 4: ls -la 권한
+        # 파일 권한 패턴 (ls -la)
         perm = _parse_permission(cv)
         if perm:
             if perm.get("world_write"):
-                total += 20; reasons.append(f"{sub}:world_write(+20)")
+                total += 25; reasons.append(f"{sub}:world_write")
             elif perm.get("group_write"):
-                total += 10; reasons.append(f"{sub}:group_write(+10)")
+                total += 12; reasons.append(f"{sub}:group_write")
             elif perm.get("world_read"):
-                total += 10; reasons.append(f"{sub}:world_read(+10)")
+                total += 10; reasons.append(f"{sub}:world_read")
             else:
-                total -= 10; reasons.append(f"{sub}:권한양호(-10)")
+                total -= 10; reasons.append(f"{sub}:권한양호")
             if not re.search(r'\broot\b', cv):
-                total += 15; reasons.append(f"{sub}:비root소유(+15)")
+                total += 15; reasons.append(f"{sub}:비root소유")
             continue
 
-        # Step 5: N개 발견
+        # N개 발견 패턴
         found_n = _count_found(cv)
         if found_n >= 0:
             if found_n == 0:
-                total -= 20; reasons.append(f"{sub}:발견없음(-20)")
+                total -= 20; reasons.append(f"{sub}:발견없음")
             elif found_n <= 5:
-                total += 20; reasons.append(f"{sub}:{found_n}개발견(+20)")
+                total += 20; reasons.append(f"{sub}:{found_n}개발견")
             else:
-                total += 35; reasons.append(f"{sub}:{found_n}개발견(+35)")
+                total += 35; reasons.append(f"{sub}:{found_n}개발견")
             continue
 
-        # Step 6: shadow 패스워드
+        # shadow 패스워드 (x: → 안전)
         if re.search(r'[a-z_][a-z0-9_-]*:x:\d+:\d+:', comb):
-            total -= 20; reasons.append(f"{sub}:shadow패스워드(-20)"); continue
+            total -= 20; reasons.append(f"{sub}:shadow패스워드"); continue
 
-        # Step 7: RUNNING + 안전설정 없음
+        # RUNNING인데 안전 설정 키워드 없음
         if svc == "RUNNING" and not any(k in comb for k in _SAFE_CONFIG_WORDS):
-            total += 20; reasons.append(f"{sub}:실행+제한없음(+20)")
+            total += 20; reasons.append(f"{sub}:실행+제한없음")
 
-        # Step 8: DB 키워드
+        # 가이드라인 DB 키워드
         matched = False
         for kw in vkws:
             if kw in comb:
-                total += 40; reasons.append(f"{sub}:취약kw[{kw[:8]}](+40)")
+                total += 40; reasons.append(f"{sub}:취약kw[{kw[:8]}]")
                 matched = True; break
         if not matched:
             for kw in okws:
                 if kw in comb:
-                    total -= 30; reasons.append(f"{sub}:양호kw[{kw[:8]}](-30)")
+                    total -= 30; reasons.append(f"{sub}:양호kw[{kw[:8]}]")
                     break
 
     total = max(0, min(100, total))
-    return total, " | ".join(reasons) or "규칙매칭없음", False
+    return total, " | ".join(reasons) or "패턴매칭없음", False, script_result
 
 
 # ──────────────────────────────────────────────────────────
@@ -345,7 +374,7 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "…" if len(text) > limit else text
 
 
-def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
+def _build_single_prompt(payload: JudgePayload, rule_score: int, script_result: str = "") -> str:
     code    = payload.item_code
     g_std   = _DB.standard(code)
     g_cp    = _DB.check_point(code)
@@ -358,13 +387,28 @@ def _build_single_prompt(payload: JudgePayload, rule_score: int) -> str:
     else:
         os_hint = os_name or "Linux"
 
+    # 서비스 상태 요약 (판정 최우선 정보)
+    svc_parts = []
+    for c in payload.check_results:
+        svc_parts.append(f"{c.sub_check[:20]}={c.service_status}")
+    svc_summary = " / ".join(svc_parts) if svc_parts else "N/A"
+
     lines = [
         f"[점검항목] {code}: {payload.item_name}",
-        f"[OS] {os_hint}  [규칙사전점수] {rule_score}/100",
+        f"[OS] {os_hint}",
+        f"[서비스상태] {svc_summary}  ← 판정 최우선 기준",
         f"[주통기기준] {_truncate(g_std, 300)}",
     ]
     if g_cp:
         lines.append(f"[점검포인트] {_truncate(g_cp, 200)}")
+
+    # 스크립트 직접 판정 결과 전달 — LLM이 결과를 뒤집지 않도록
+    if script_result == "취약":
+        lines.append(f"[스크립트판정] 취약 ← 이미 확정된 결과. result 필드는 반드시 '취약'으로 출력하고 reason/remediation 위주로 상세 작성")
+    elif script_result == "양호":
+        lines.append(f"[스크립트판정] 양호 ← 이미 확정된 결과. result 필드는 반드시 '양호'으로 출력하고 reason/remediation 위주로 상세 작성")
+    elif script_result == "규칙불가":
+        lines.append(f"[스크립트판정] 규칙불가 ← 자동 판정 불가. 수집값 분석 후 직접 판정 필요")
 
     lines.append("")
     lines.append("[수집결과] ← 아래 값만 근거로 판정할 것")
@@ -425,31 +469,48 @@ SINGLE_SYSTEM = """\
 1. 백틱(`) · 코드블록(```json) 사용 절대 금지 — JSON 객체만 바로 출력
 2. JSON 객체 1개만 출력 — 앞뒤 설명 텍스트 금지
 3. 문자열 값 안 줄바꿈(\\n) 금지 — 한 줄 텍스트로 작성
-4. 필드 순서 고정: item_code → vuln_score → result → reason → remediation
+4. 필드 순서 고정: item_code → result → reason → remediation
 
 [JSON 스키마]
-{"item_code":"U-XX","vuln_score":정수0~100,"result":"취약|양호|해당없음","reason":"수집값인용+기준비교+판정근거(120자이내)","remediation":"현재OS맞는조치명령어(80자이내)"}
+{"item_code":"U-XX","result":"취약|양호|해당없음","reason":"5문장판정근거","remediation":"5문장조치방법"}
 
-[판정 기준]
-- NOT_INSTALLED → result="해당없음", vuln_score=0
-- NOT_RUNNING   → result="양호" 우선 (설정값 확인 후 최종 결정)
-- N/A           → collected_value 값만으로 판단
-- vuln_score 80+ → result="취약"
-- vuln_score 20- → result="양호"
-- 20~79 → collected_value 분석 결과로 결정 (애매하면 취약 보수적 처리)
+[서비스 상태 판정 — 최우선 기준]
+- NOT_INSTALLED → result="해당없음" (해당 서비스/패키지 미설치, 점검 불필요)
+- NOT_RUNNING   → result="양호" 우선 (비활성 서비스는 공격 경로 없음, 단 설정값이 명백히 취약하면 취약)
+- RUNNING       → 아래 수집값(collected_value)을 분석하여 최종 판정
+- N/A           → collected_value 만으로 판단 (파일 권한·계정 설정 등)
+
+[reason 작성 — 5문장, 비전문가도 이해 가능하게]
+1문장: 이 항목이 무엇을 점검하는지 (항목명과 보안 목적)
+2문장: 실제 수집된 값이 무엇인지 (collected_value를 직접 인용)
+3문장: 보안 가이드라인이 요구하는 기준 값/상태가 무엇인지
+4문장: 수집값이 그 기준을 충족하는지 또는 어떻게 위반하는지
+5문장: 취약이면 어떤 공격/위험이 발생할 수 있는지, 양호이면 왜 안전한지
+
+[remediation 작성 — 5문장, 실제 조치 가능하도록]
+1문장: 어떤 파일 또는 설정을 변경해야 하는지
+2문장: 구체적인 수정 명령어 또는 설정 값 (현재 OS 환경 기준)
+3문장: 변경 적용 방법 (서비스 재시작, 권한 재적용 등)
+4문장: 조치 후 검증 명령어 또는 확인 방법
+5문장: 주의사항 (서비스 중단 여부, 영향 범위, 롤백 방법 등)
+
+[판정불가 처리]
+- collected_value가 비어있거나 "ERROR", "오류", "수동 점검 필요"만 있으면 result="해당없음"
+- reason에 "자동 수집 불가 — 관리자 수동 점검 필요" 명시
+- [스크립트판정]이 "취약"/"양호"로 제시된 경우 result는 반드시 그 값으로 출력 (변경 금지)
 
 [할루시네이션 방지 — 반드시 준수]
-- 수집된 collected_value 에 없는 내용 추가 절대 금지
+- 수집된 collected_value에 없는 내용 추가 절대 금지
 - 추측·가정 금지 — 실제 수집값만 근거로 사용
-- 파일/서비스가 없으면 해당없음 또는 양호로 처리, 임의로 취약 판정 금지\
+- 파일/서비스가 없으면 해당없음 또는 양호 처리, 임의로 취약 판정 금지\
 """
 
 BATCH_SYSTEM = (
-    "주통기 보안 점검 전문가. JSON 배열만 출력 (입력 ITEM 번호 순서 반드시 유지).\n"
-    '[{"item_code":"U-XX","vuln_score":0~100,"result":"취약|양호|해당없음",'
-    '"reason":"3줄: 해당 항목 실제 수집값 인용·기준 비교·근거 명시",'
-    '"remediation":"1~2줄: 현재 OS 환경 기준 구체적 명령어 포함"},...]\n'
-    "NOT_INSTALLED/NOT_RUNNING→해당없음 우선 | 80+취약 0~19양호\n"
+    "주통기 Unix 보안 점검 전문가. JSON 배열만 출력 (입력 ITEM 번호 순서 반드시 유지).\n"
+    '[{"item_code":"U-XX","result":"취약|양호|해당없음",'
+    '"reason":"5문장: 1)항목목적 2)수집값인용 3)기준설명 4)기준충족여부 5)위험/안전이유",'
+    '"remediation":"5문장: 1)변경대상 2)명령어 3)적용방법 4)검증방법 5)주의사항"},...]\n'
+    "서비스 판정 최우선: NOT_INSTALLED→해당없음 / NOT_RUNNING→양호 우선 / RUNNING→수집값분석\n"
     "⚠️ 항목 격리 규칙 (절대 준수):\n"
     "  · 각 항목은 ━━[ITEM N/T: CODE]━━ 블록 안의 데이터만 참조\n"
     "  · 다른 항목의 수집값·판단 절대 혼용 금지 — 항목 간 데이터 교차 참조 불가\n"
@@ -501,15 +562,13 @@ def _parse_single_json(raw: str) -> dict:
     # 5) 정규식 필드별 추출 (최후 수단)
     result = {}
     for fname, pat in [
-        ("vuln_score",  r'"vuln_score"\s*:\s*(\d+)'),
         ("result",      r'"result"\s*:\s*"([^"]+)"'),
-        ("reason",      r'"reason"\s*:\s*"((?:[^"\\]|\\.){0,300})"'),
-        ("remediation", r'"remediation"\s*:\s*"((?:[^"\\]|\\.){0,200})"'),
+        ("reason",      r'"reason"\s*:\s*"((?:[^"\\]|\\.){0,500})"'),
+        ("remediation", r'"remediation"\s*:\s*"((?:[^"\\]|\\.){0,500})"'),
     ]:
         m = re.search(pat, cleaned, re.DOTALL)
         if m:
-            v = m.group(1)
-            result[fname] = int(v) if fname == "vuln_score" else v
+            result[fname] = m.group(1)
     return result
 
 
@@ -551,10 +610,10 @@ def _parse_batch_json(raw: str, batch: list) -> list:
 # ──────────────────────────────────────────────────────────
 
 async def _call_single_item(
-    client, payload: JudgePayload, rule_score: int, label: str
+    client, payload: JudgePayload, rule_score: int, label: str, script_result: str = ""
 ) -> dict:
     """1항목 1요청. collected_value 기반 판정."""
-    prompt = _build_single_prompt(payload, rule_score)
+    prompt = _build_single_prompt(payload, rule_score, script_result)
     try:
         with open(PROMPT_DUMP_FILE, "a", encoding="utf-8") as _pf:
             _pf.write(f"\n{'='*60}\n[{payload.item_code}] {payload.item_name}\n[SYSTEM]\n{SINGLE_SYSTEM}\n[USER]\n{prompt}\n")
@@ -571,7 +630,7 @@ async def _call_single_item(
                 config=types.GenerateContentConfig(
                     system_instruction=SINGLE_SYSTEM,
                     temperature=0.1,
-                    max_output_tokens=600,
+                    max_output_tokens=1200,
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
@@ -661,56 +720,65 @@ async def _call_batch(
 
 def _finalize(
     payload: JudgePayload, rule_score: int, rule_reason: str,
-    llm_data: dict, mode: str
+    llm_data: dict, mode: str, script_result: str = ""
 ) -> JudgeResult:
-    code      = payload.item_code
-    llm_score = int(llm_data.get("vuln_score", 50)) if llm_data else -1
+    """
+    최종 판정 조합.
+    script_result가 있으면 그 결과를 LLM이 뒤집을 수 없음 (할루시네이션 차단).
+    LLM은 reason/remediation 품질 향상에만 사용.
+    """
+    code = payload.item_code
 
-    if mode == "rule_only" or not llm_data:
-        final_score = rule_score
-        reason      = f"[규칙] {rule_reason}"
-        remediation = _DB.remediation(code)
-    elif mode == "llm_only":
-        final_score = llm_score if llm_score != -1 else 50
-        reason      = f"[LLM] {llm_data.get('reason', '')}"
-        remediation = llm_data.get("remediation", "수동 확인 필요")
-    else:  # hybrid
-        if llm_score == -1:
-            final_score = rule_score
-            reason      = f"[규칙] {rule_reason} (LLM실패→규칙대체)"
-            remediation = _DB.remediation(code)
-        else:
-            final_score = round(
-                rule_score * SCORE_WEIGHT_RULE + llm_score * SCORE_WEIGHT_LLM
-            )
-            note   = f"(규칙{rule_score}×0.3+LLM{llm_score}×0.7={final_score})"
-            reason = (
-                f"[규칙] {rule_reason} | "
-                f"[LLM] {llm_data.get('reason', '')} | {note}"
-            )
-            remediation = llm_data.get("remediation", "수동 확인 필요")
-
-    # LLM 해당없음 명시 → 우선 적용
-    if llm_data and llm_data.get("result") == "해당없음":
-        return _make_result(
-            payload, code, "해당없음",
-            f"[LLM] {llm_data.get('reason', '해당없음')}",
-            "해당 없음", 0.9, mode
+    # ── 규칙불가: 수집 자체가 불가 + LLM도 없음 → 판정 불가로 처리
+    if script_result == "규칙불가" and not llm_data:
+        reason_text = (
+            f"이 항목({payload.item_name})은 자동 수집 규칙을 적용할 수 없는 환경입니다. "
+            f"관리자가 직접 확인해야 합니다. "
+            f"주통기 기준: {_DB.standard(code)}. "
+            f"점검 포인트: {_DB.check_point(code) or '해당 항목 가이드라인 참조'}. "
+            f"수동 점검 후 결과를 기록해 주세요."
         )
+        return _make_result(payload, code, "해당없음", reason_text,
+                            _DB.remediation(code) or "관리자 수동 확인 필요", 0.3, mode)
 
-    # 점수 → 결과
-    if final_score >= THRESHOLD_VULN:
-        result = "취약"
-        conf   = round(min(1.0, final_score / 100), 2)
-    elif final_score < THRESHOLD_OK:
-        result = "양호"
-        conf   = round(min(1.0, (100 - final_score) / 100), 2)
+    # ── rule_only 모드 또는 LLM 응답 없음
+    if mode == "rule_only" or not llm_data:
+        if rule_score >= THRESHOLD_VULN:
+            result, conf = "취약", min(0.95, rule_score / 100)
+        elif rule_score < THRESHOLD_OK:
+            result, conf = "양호", min(0.95, (100 - rule_score) / 100)
+        else:
+            result, conf = "취약", 0.55
+        return _make_result(payload, code, result, rule_reason, _DB.remediation(code), round(conf, 2), mode)
+
+    # ── LLM 응답 있음
+    llm_result      = (llm_data.get("result") or "").strip()
+    llm_reason      = llm_data.get("reason", "").strip()
+    llm_remediation = llm_data.get("remediation", "").strip()
+
+    reason      = llm_reason      or rule_reason
+    remediation = llm_remediation or _DB.remediation(code) or "수동 확인 필요"
+
+    # ── 스크립트 확정 판정 보호 (LLM이 결과를 뒤집을 수 없음)
+    if script_result == "취약":
+        result = "취약"  # LLM이 양호로 판정해도 무시
+        conf   = 0.93
+    elif script_result == "양호":
+        result = "양호"  # LLM이 취약으로 판정해도 무시 (보수적 보호)
+        conf   = 0.91
+    elif llm_result in ("취약", "양호", "해당없음"):
+        result = llm_result
+        conf   = 0.88
     else:
-        result = "취약"
-        conf   = 0.5
-        reason = f"[검토필요→취약] {reason}"
+        # LLM 응답 이상 → 규칙 점수 폴백
+        result = "취약" if rule_score >= THRESHOLD_VULN else "양호"
+        conf   = 0.60
 
-    reason = " | ".join(reason.split(" | ")[:4])
+    # LLM이 해당없음으로 판정한 경우는 항상 통과 (서비스 확인 후 판단)
+    if llm_result == "해당없음" and script_result not in ("취약", "양호"):
+        result = "해당없음"
+        conf   = 0.90
+
     return _make_result(payload, code, result, reason, remediation, conf, mode)
 
 
@@ -756,9 +824,9 @@ class BatchJudge:
         results = asyncio.run(BatchJudge.run(payloads, mode="hybrid"))
 
     judge_mode:
-        "hybrid"    규칙×0.3 + LLM×0.7  (기본)
-        "rule_only" LLM 없음
-        "llm_only"  규칙 무시
+        "hybrid"    스크립트판정 우선 + LLM reason/remediation 생성 (기본)
+        "rule_only" LLM 없음 — 규칙/스크립트 판정만 사용
+        "llm_only"  규칙 무시 — LLM이 모든 항목 판정
     """
 
     @staticmethod
@@ -782,96 +850,131 @@ class BatchJudge:
         if not api_key:
             api_key = _get_api_key()
 
-        # ── 1단계: 규칙 분류 ──────────────────────────────────
-        not_installed:   list = []
-        certain:         list = []
-        confirmed_ok:    list = []
-        need_individual: list = []
-        rule_map:        dict = {}
+        # ── 1단계: 규칙 분류 → 6개 버킷 ─────────────────────
+        not_installed:   list = []  # 해당없음 즉시 (LLM 없음)
+        certain_ok:      list = []  # 서비스 비활성 등 확정양호 즉시 (LLM 없음)
+        certain_vuln:    list = []  # 스크립트 확정취약 → LLM은 text 생성만
+        certain_script_ok: list = []  # 스크립트 확정양호 → LLM은 text 생성만
+        rule_cannot:     list = []  # 규칙불가 → LLM 전권
+        need_individual: list = []  # 패턴 불확실 → LLM 전권
+
+        # rule_map: item_code → (score, reason, script_result)
+        rule_map: dict = {}
 
         for p in payloads:
-            score, reason, conclusive = _rule_score(p)
-            rule_map[p.item_code] = (score, reason)
+            score, reason, conclusive, sr = _rule_score(p)
+            rule_map[p.item_code] = (score, reason, sr)
 
             if mode == "rule_only":
-                certain.append((p, score, reason))
+                certain_vuln.append(p) if score >= THRESHOLD_VULN else certain_ok.append(p)
             elif score == -1:
                 not_installed.append((p, reason))
+            elif sr == "규칙불가":
+                rule_cannot.append(p)
+            elif conclusive and score == 0:
+                certain_ok.append(p)
             elif conclusive and score >= RULE_CERTAIN_VULN:
-                certain.append((p, score, reason))
-            elif conclusive and score < THRESHOLD_VULN:
-                confirmed_ok.append(p)
+                certain_vuln.append(p)
+            elif conclusive and sr == "양호":
+                certain_script_ok.append(p)
             else:
                 need_individual.append(p)
 
-        n_llm_calls   = len(confirmed_ok) + len(need_individual)
-        eta = n_llm_calls * REQUEST_MIN_DELAY
+        n_llm = len(certain_vuln) + len(certain_script_ok) + len(rule_cannot) + len(need_individual)
+        eta   = n_llm * REQUEST_MIN_DELAY
 
         print(
             f"[BatchJudge] mode={mode} | model={_gemini_model()}\n"
-            f"  전체={len(payloads)} | 미설치={len(not_installed)} | "
-            f"확정취약={len(certain)} | "
-            f"확정양호(개별LLM)={len(confirmed_ok)} | "
-            f"개별LLM={len(need_individual)}\n"
-            f"  MAX_CONCURRENT={MAX_CONCURRENT} REQUEST_MIN_DELAY={REQUEST_MIN_DELAY}s "
-            f"MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}\n"
-            f"  예상≈{eta:.0f}초({eta/60:.1f}분)"
+            f"  전체={len(payloads)} | 해당없음={len(not_installed)} | "
+            f"즉시양호={len(certain_ok)} | 확정취약(LLM텍스트)={len(certain_vuln)} | "
+            f"확정양호(LLM텍스트)={len(certain_script_ok)} | "
+            f"규칙불가(LLM전권)={len(rule_cannot)} | 불확실(LLM전권)={len(need_individual)}\n"
+            f"  LLM호출예상={n_llm}건 | 예상≈{eta:.0f}초({eta/60:.1f}분)"
         )
 
         results: list = []
 
-        # ── 2단계: 미설치 → 해당없음 ─────────────────────────
+        # ── 2단계: 미설치 → 해당없음 즉시 ───────────────────
         for p, reason in not_installed:
-            r = _finalize(p, 0, reason, {"result": "해당없음", "reason": reason}, mode)
+            reason_text = (
+                f"이 항목({p.item_name})은 해당 서비스 또는 패키지가 설치되어 있지 않아 점검 대상이 아닙니다. "
+                f"설치되지 않은 서비스는 공격 경로가 존재하지 않으므로 보안 위험이 없습니다. "
+                f"다만 추후 해당 서비스를 설치할 경우 이 항목을 재점검해야 합니다. "
+                f"주통기 가이드라인은 서비스 미설치 시 '해당없음'으로 처리합니다. "
+                f"현재 환경에서는 조치가 불필요합니다."
+            )
+            r = _finalize(p, 0, reason, {"result": "해당없음", "reason": reason_text}, mode, sr)
             results.append(r)
-            print(f"  [해당없음] {p.item_code} (미설치)")
+            print(f"  [해당없음] {p.item_code}")
 
-        # ── 3단계: 확정 취약 즉시 처리 ───────────────────────
-        for p, score, reason in certain:
-            r = _finalize(p, score, reason, {}, mode)
+        # ── 3단계: 서비스 비활성 확정양호 즉시 ──────────────
+        for p in certain_ok:
+            score, reason, sr = rule_map[p.item_code]
+            reason_text = (
+                f"이 항목({p.item_name})은 관련 서비스가 현재 실행되고 있지 않아 보안 위협이 없는 상태입니다. "
+                f"수집값 확인 결과 서비스가 비활성화(NOT_RUNNING 또는 NOT_INSTALLED) 상태입니다. "
+                f"비활성화된 서비스는 외부 공격자가 접근할 수 있는 경로가 차단되어 있습니다. "
+                f"주통기 가이드라인은 사용하지 않는 불필요한 서비스를 비활성화하도록 권고하므로, 현재 상태는 가이드라인을 준수합니다. "
+                f"서비스를 다시 활성화할 계획이 있다면 활성화 전 이 항목을 재점검하세요."
+            )
+            r = _finalize(p, score, reason, {"result": "양호", "reason": reason_text}, mode, sr)
             results.append(r)
-            print(f"  [확정취약] {p.item_code}({score}점)")
+            print(f"  [즉시양호] {p.item_code} (서비스비활성)")
 
         key = api_key or _get_api_key()
 
-        if not (confirmed_ok or need_individual) or not key:
-            if not key and (confirmed_ok or need_individual):
+        # LLM 호출 항목 없거나 API 키 없음 → 규칙 결과로 대체
+        llm_items = certain_vuln + certain_script_ok + rule_cannot + need_individual
+        if not llm_items or not key:
+            if not key and llm_items:
                 print("[BatchJudge] GEMINI_API_KEY 미설정 → 규칙 점수로 대체")
-            for p in confirmed_ok + need_individual:
-                score, reason = rule_map[p.item_code]
-                results.append(_finalize(p, score, reason, {}, "rule_only"))
+            for p in llm_items:
+                score, reason, sr = rule_map[p.item_code]
+                results.append(_finalize(p, score, reason, {}, "rule_only", sr))
+            order = {p.item_code: i for i, p in enumerate(payloads)}
+            results.sort(key=lambda r: order.get(r.item_code, 999))
             _print_summary(results)
             return results
 
         client = genai.Client(api_key=key)
         print(f"[BatchJudge] AI Studio 모드 — model={_gemini_model()}")
-        rule_scores_map = {c: s for c, (s, _) in rule_map.items()}
 
-        # ── 4단계: 확정 양호 → 개별 LLM (1항목 1요청, AFC 비활성) ────────
-        if confirmed_ok:
-            print(f"\n[개별LLM-확정양호] {len(confirmed_ok)}건 (순차 처리)...")
-            for idx, p in enumerate(confirmed_ok, 1):
-                score, reason = rule_map[p.item_code]
-                label = f"확정양호{idx}/{len(confirmed_ok)}[{p.item_code}]"
-                print(f"  {label}")
-                llm_d = await _call_single_item(client, p, score, label)
-                r = _finalize(p, score, reason, llm_d or {}, mode)
+        async def _llm_call(p, label_prefix: str, bucket_len: int, idx: int) -> tuple:
+            score, reason, sr = rule_map[p.item_code]
+            label = f"{label_prefix}{idx}/{bucket_len}[{p.item_code}]"
+            print(f"  {label}")
+            llm_d = await _call_single_item(client, p, score, label, script_result=sr)
+            r = _finalize(p, score, reason, llm_d or {}, mode, sr)
+            print(f"    {p.item_code}: 스크립트={sr or '없음'} → 최종={r.result}")
+            return r
+
+        # ── 4단계: 스크립트 확정취약 → LLM reason/remediation 생성 ──
+        if certain_vuln:
+            print(f"\n[LLM-확정취약] {len(certain_vuln)}건 (reason/remediation 생성)...")
+            for idx, p in enumerate(certain_vuln, 1):
+                r = await _llm_call(p, "확정취약", len(certain_vuln), idx)
                 results.append(r)
-                vs = (llm_d or {}).get("vuln_score", "N/A")
-                print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
 
-        # ── 5단계: 불확실 → 개별 LLM (순차, MAX_CONCURRENT=1로 버스트 방지) ─
+        # ── 5단계: 스크립트 확정양호 → LLM reason/remediation 생성 ──
+        if certain_script_ok:
+            print(f"\n[LLM-확정양호] {len(certain_script_ok)}건 (reason/remediation 생성)...")
+            for idx, p in enumerate(certain_script_ok, 1):
+                r = await _llm_call(p, "확정양호", len(certain_script_ok), idx)
+                results.append(r)
+
+        # ── 6단계: 규칙불가 → LLM 전권 판정 ────────────────
+        if rule_cannot:
+            print(f"\n[LLM-규칙불가] {len(rule_cannot)}건 (LLM 전권 판정)...")
+            for idx, p in enumerate(rule_cannot, 1):
+                r = await _llm_call(p, "규칙불가", len(rule_cannot), idx)
+                results.append(r)
+
+        # ── 7단계: 패턴 불확실 → LLM 전권 판정 ─────────────
         if need_individual:
-            print(f"\n[개별LLM] {len(need_individual)}건 (순차 처리)...")
+            print(f"\n[LLM-불확실] {len(need_individual)}건 (LLM 전권 판정)...")
             for idx, p in enumerate(need_individual, 1):
-                score, reason = rule_map[p.item_code]
-                label = f"개별{idx}/{len(need_individual)}[{p.item_code}]"
-                print(f"  {label}")
-                llm_d = await _call_single_item(client, p, score, label)
-                r = _finalize(p, score, reason, llm_d or {}, mode)
+                r = await _llm_call(p, "불확실", len(need_individual), idx)
                 results.append(r)
-                vs = (llm_d or {}).get("vuln_score", "N/A")
-                print(f"    {p.item_code}: 규칙={score} LLM={vs} → {r.result}({r.confidence:.0%})")
 
         # 원래 순서 복원
         order = {p.item_code: i for i, p in enumerate(payloads)}
@@ -892,26 +995,26 @@ def _print_summary(results: list):
 # ──────────────────────────────────────────────────────────
 
 def debug_print_prompt(payload: JudgePayload):
-    score, reason, conclusive = _rule_score(payload)
+    score, reason, conclusive, sr = _rule_score(payload)
     print("=" * 70)
-    print(f"[디버그] {payload.item_code} | 규칙점수={score} | conclusive={conclusive}")
+    print(f"[디버그] {payload.item_code} | 규칙점수={score} | conclusive={conclusive} | script_result={sr!r}")
     print(f"[디버그] 규칙판단: {reason}")
     print("=" * 70)
     print("[SYSTEM PROMPT]")
     print(SINGLE_SYSTEM)
     print("-" * 70)
     print("[USER PROMPT]")
-    print(_build_single_prompt(payload, score))
-    print(f"\n[글자수: {len(_build_single_prompt(payload, score))} / {MAX_PROMPT_CHARS}]")
+    print(_build_single_prompt(payload, score, sr))
+    print(f"\n[글자수: {len(_build_single_prompt(payload, score, sr))} / {MAX_PROMPT_CHARS}]")
     print("=" * 70)
 
 
 def debug_print_batch_prompt(payloads: list):
     rule_scores = {}
     for p in payloads:
-        score, reason, _ = _rule_score(p)
+        score, reason, _, sr = _rule_score(p)
         rule_scores[p.item_code] = score
-        print(f"[규칙] {p.item_code}: score={score} | {reason}")
+        print(f"[규칙] {p.item_code}: score={score} | script={sr!r} | {reason}")
     print("=" * 70)
     print("[BATCH SYSTEM PROMPT]")
     print(BATCH_SYSTEM)
@@ -919,5 +1022,5 @@ def debug_print_batch_prompt(payloads: list):
     print("[BATCH USER PROMPT]")
     prompt = _build_batch_prompt(payloads, rule_scores)
     print(prompt)
-    print(f"\n[글자수: {len(prompt)} / {MAX_PROMPT_CHARS * BATCH_SIZE}]")
+    print(f"\n[글자수: {len(prompt)} / {MAX_PROMPT_CHARS}]")
     print("=" * 70)
