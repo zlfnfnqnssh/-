@@ -237,12 +237,23 @@ _SAFE_CONFIG_WORDS = [
 # ──────────────────────────────────────────────────────────
 
 def _get_script_result(checks) -> str:
-    """check_results에서 스크립트 직접 판정 결과를 추출 (가장 먼저 발견된 비어있지 않은 값)."""
-    for c in checks:
-        sr = getattr(c, "script_result", "").strip()
-        if sr:
-            return sr
-    return ""
+    """check_results 의 script_result 들을 보수적으로 집계.
+
+    이전: 첫 번째 비어있지 않은 값 반환 → 다중 sub_check 항목에서 뒤쪽 '취약' 누락.
+    현재: 보수적 집계
+       - 하나라도 '취약'   → '취약' (확정 위반이 존재)
+       - 모두 '양호'       → '양호'
+       - 그 외             → '규칙불가' (LLM 에 위임)
+    """
+    signals = [(getattr(c, "script_result", "") or "").strip() for c in checks]
+    signals = [s for s in signals if s]  # 빈 값 제외
+    if not signals:
+        return ""
+    if any(s == "취약" for s in signals):
+        return "취약"
+    if all(s == "양호" for s in signals):
+        return "양호"
+    return "규칙불가"
 
 
 def _rule_score(payload: JudgePayload) -> tuple[int, str, bool, str]:
@@ -502,7 +513,15 @@ SINGLE_SYSTEM = """\
 [할루시네이션 방지 — 반드시 준수]
 - 수집된 collected_value에 없는 내용 추가 절대 금지
 - 추측·가정 금지 — 실제 수집값만 근거로 사용
-- 파일/서비스가 없으면 해당없음 또는 양호 처리, 임의로 취약 판정 금지\
+- 파일/서비스가 없으면 해당없음 또는 양호 처리, 임의로 취약 판정 금지
+
+[가이드라인 우선 원칙 — 절대 위반 금지]
+- 주통기 가이드라인이 유일한 정답 기준입니다. [주통기기준]/[점검포인트]에 명시된 기준값을 무시하거나 완화하지 마세요.
+- "Debian/Ubuntu/RHEL 기본값", "배포판 관례", "일반 운영 환경에서 흔한 설정" 등의 이유로 가이드 기준 위반을 양호로 정당화하지 마세요.
+  예시(반드시 피할 패턴): 가이드 기준 perm <= 640 인데 실제 644 라면, "Ubuntu 기본값이라 양호" 가 아니라 "기준 위반 = 취약" 입니다.
+- 환경 정보(설치된 패키지, 데몬 상태, 경로 차이 등)는 '판정 결과를 어떻게 설명할지' 보조 정보로만 활용하세요. 판정 결과 자체를 환경 정보로 뒤집지 마세요.
+- 가이드 기준이 모호하거나 여러 해석이 가능하면 가장 엄격한 해석을 채택하세요.
+- reason 작성 시 가이드 기준값을 명시적으로 인용한 뒤(예: '가이드 기준: perm <= 640'), 수집값이 그 기준과 일치/불일치하는지 사실 그대로 비교만 하세요.\
 """
 
 BATCH_SYSTEM = (
