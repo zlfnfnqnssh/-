@@ -64,3 +64,4 @@ knowledge/data/uploads/*.pdf
 
 # Node
 node_modules/
+.playwright-mcp/
